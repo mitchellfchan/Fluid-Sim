@@ -5,10 +5,12 @@ namespace Seb.Fluid.Demo
 {
 	public class OrbitCam : MonoBehaviour
 	{
-		public float moveSpeed = 3;
-		public float rotationSpeed = 220;
-		public float zoomSpeed = 0.1f;
-		public Vector3 pivot;
+			public float moveSpeed = 3;
+	public float rotationSpeed = 220;
+	public float zoomSpeed = 0.1f;
+	public float minZoomDistance = 0.5f;
+	public float maxZoomDistance = 50f;
+	public Vector3 pivot;
 		Vector2 mousePosOld;
 		bool hasFocusOld;
 		public float focusDst = 1f;
@@ -20,11 +22,20 @@ namespace Seb.Fluid.Demo
 		private Vector3 startPos;
 		Quaternion startRot;
 
-		void Start()
+			void Start()
+	{
+		startPos = transform.position;
+		startRot = transform.rotation;
+		
+		// Ensure camera starts within zoom bounds
+		Vector3 directionToPivot = pivot - transform.position;
+		float currentDistance = directionToPivot.magnitude;
+		if (currentDistance < minZoomDistance || currentDistance > maxZoomDistance)
 		{
-			startPos = transform.position;
-			startRot = transform.rotation;
+			float clampedDistance = Mathf.Clamp(currentDistance, minZoomDistance, maxZoomDistance);
+			transform.position = pivot - directionToPivot.normalized * clampedDistance;
 		}
+	}
 
 		void Update()
 		{
@@ -123,8 +134,25 @@ namespace Seb.Fluid.Demo
 			}
 		}
 
-			transform.Translate(Vector3.forward * mouseScroll * zoomSpeed * dstWeight);
+					// Apply zoom with distance constraints
+		if (mouseScroll != 0)
+		{
+			Vector3 directionToPivot = pivot - transform.position;
+			float currentDistance = directionToPivot.magnitude;
+			float zoomDelta = mouseScroll * zoomSpeed * dstWeight;
+			float newDistance = currentDistance - zoomDelta;
+			
+			// Clamp the distance to stay within limits
+			newDistance = Mathf.Clamp(newDistance, minZoomDistance, maxZoomDistance);
+			
+			// Only move if we're within bounds or moving away from the limit
+			if (newDistance != currentDistance)
+			{
+				Vector3 newPosition = pivot - directionToPivot.normalized * newDistance;
+				transform.position = newPosition;
+			}
 		}
+	}
 
 		void OnDrawGizmosSelected()
 		{
