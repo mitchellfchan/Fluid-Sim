@@ -3,6 +3,7 @@ using Seb.Helpers;
 using UnityEngine;
 using Unity.Mathematics;
 using UnityEngine.Serialization;
+using UnityEngine.InputSystem;
 
 namespace Seb.Fluid2D.Simulation
 {
@@ -185,9 +186,21 @@ namespace Seb.Fluid2D.Simulation
 			compute.SetFloat("SpikyPow2DerivativeScalingFactor", 12 / (Mathf.Pow(smoothingRadius, 4) * Mathf.PI));
 
 			// Mouse interaction settings:
-			Vector2 mousePos = Camera.main.ScreenToWorldPoint(Input.mousePosition);
-			bool isPullInteraction = Input.GetMouseButton(0);
-			bool isPushInteraction = Input.GetMouseButton(1);
+			Vector2 mousePos = Vector2.zero;
+			bool isPullInteraction = false;
+			bool isPushInteraction = false;
+			
+			if (Mouse.current != null)
+			{
+				Vector2 screenPos = Mouse.current.position.ReadValue();
+				// Only convert to world position if mouse is within screen bounds
+				if (screenPos.x >= 0 && screenPos.y >= 0 && screenPos.x <= Screen.width && screenPos.y <= Screen.height)
+				{
+					mousePos = Camera.main.ScreenToWorldPoint(screenPos);
+				}
+				isPullInteraction = Mouse.current.leftButton.isPressed;
+				isPushInteraction = Mouse.current.rightButton.isPressed;
+			}
 			float currInteractStrength = 0;
 			if (isPushInteraction || isPullInteraction)
 			{
@@ -209,20 +222,22 @@ namespace Seb.Fluid2D.Simulation
 			velocityBuffer.SetData(spawnData.velocities);
 		}
 
-		void HandleInput()
+			void HandleInput()
+	{
+		if (Keyboard.current != null)
 		{
-			if (Input.GetKeyDown(KeyCode.Space))
+			if (Keyboard.current.spaceKey.wasPressedThisFrame)
 			{
 				isPaused = !isPaused;
 			}
 
-			if (Input.GetKeyDown(KeyCode.RightArrow))
+			if (Keyboard.current.rightArrowKey.wasPressedThisFrame)
 			{
 				isPaused = false;
 				pauseNextFrame = true;
 			}
 
-			if (Input.GetKeyDown(KeyCode.R))
+			if (Keyboard.current.rKey.wasPressedThisFrame)
 			{
 				isPaused = true;
 				// Reset positions, the run single frame to get density etc (for debug purposes) and then reset positions again
@@ -231,6 +246,7 @@ namespace Seb.Fluid2D.Simulation
 				SetInitialBufferData(spawnData);
 			}
 		}
+	}
 
 
 		void OnDestroy()
@@ -246,11 +262,15 @@ namespace Seb.Fluid2D.Simulation
 			Gizmos.DrawWireCube(Vector2.zero, boundsSize);
 			Gizmos.DrawWireCube(obstacleCentre, obstacleSize);
 
-			if (Application.isPlaying)
+					if (Application.isPlaying && Mouse.current != null)
+		{
+			Vector2 screenPos = Mouse.current.position.ReadValue();
+			// Only convert to world position if mouse is within screen bounds
+			if (screenPos.x >= 0 && screenPos.y >= 0 && screenPos.x <= Screen.width && screenPos.y <= Screen.height)
 			{
-				Vector2 mousePos = Camera.main.ScreenToWorldPoint(Input.mousePosition);
-				bool isPullInteraction = Input.GetMouseButton(0);
-				bool isPushInteraction = Input.GetMouseButton(1);
+				Vector2 mousePos = Camera.main.ScreenToWorldPoint(screenPos);
+				bool isPullInteraction = Mouse.current.leftButton.isPressed;
+				bool isPushInteraction = Mouse.current.rightButton.isPressed;
 				bool isInteracting = isPullInteraction || isPushInteraction;
 				if (isInteracting)
 				{
@@ -258,6 +278,7 @@ namespace Seb.Fluid2D.Simulation
 					Gizmos.DrawWireSphere(mousePos, interactionRadius);
 				}
 			}
+		}
 		}
 	}
 }

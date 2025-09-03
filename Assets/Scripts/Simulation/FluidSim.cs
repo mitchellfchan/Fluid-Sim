@@ -1,5 +1,6 @@
 using System;
 using UnityEngine;
+using UnityEngine.InputSystem;
 using Seb.GPUSorting;
 using Unity.Mathematics;
 using System.Collections.Generic;
@@ -401,20 +402,22 @@ namespace Seb.Fluid.Simulation
 			simTimer = 0;
 		}
 
-		void HandleInput()
+			void HandleInput()
+	{
+		if (Keyboard.current != null)
 		{
-			if (Input.GetKeyDown(KeyCode.Space))
+			if (Keyboard.current.spaceKey.wasPressedThisFrame)
 			{
 				isPaused = !isPaused;
 			}
 
-			if (Input.GetKeyDown(KeyCode.RightArrow))
+			if (Keyboard.current.rightArrowKey.wasPressedThisFrame)
 			{
 				isPaused = false;
 				pauseNextFrame = true;
 			}
 
-			if (Input.GetKeyDown(KeyCode.R))
+			if (Keyboard.current.rKey.wasPressedThisFrame)
 			{
 				pauseNextFrame = true;
 				SetInitialBufferData(spawnData);
@@ -426,11 +429,12 @@ namespace Seb.Fluid.Simulation
 				}
 			}
 
-			if (Input.GetKeyDown(KeyCode.Q))
+			if (Keyboard.current.qKey.wasPressedThisFrame)
 			{
 				inSlowMode = !inSlowMode;
 			}
 		}
+	}
 
 		private float ActiveTimeScale => inSlowMode ? slowTimeScale : normalTimeScale;
 

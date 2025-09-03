@@ -1,4 +1,5 @@
 using UnityEngine;
+using UnityEngine.InputSystem;
 
 namespace Seb.Fluid.Demo
 {
@@ -8,7 +9,7 @@ namespace Seb.Fluid.Demo
 		public float rotationSpeed = 220;
 		public float zoomSpeed = 0.1f;
 		public Vector3 pivot;
-		Vector3 mousePosOld;
+		Vector2 mousePosOld;
 		bool hasFocusOld;
 		public float focusDst = 1f;
 		Vector3 lastCtrlPivot;
@@ -27,69 +28,100 @@ namespace Seb.Fluid.Demo
 
 		void Update()
 		{
-			if (Application.isFocused != hasFocusOld)
+					if (Application.isFocused != hasFocusOld)
+		{
+			hasFocusOld = Application.isFocused;
+			if (Mouse.current != null)
 			{
-				hasFocusOld = Application.isFocused;
-				mousePosOld = Input.mousePosition;
-			}
-
-			// Reset view on double click
-			if (Input.GetMouseButtonDown(0))
-			{
-				if (Time.time - lastLeftClickTime < 0.2f)
+				Vector2 screenPos = Mouse.current.position.ReadValue();
+				// Only use mouse position if within screen bounds
+				if (screenPos.x >= 0 && screenPos.y >= 0 && screenPos.x <= Screen.width && screenPos.y <= Screen.height)
 				{
-					transform.position = startPos;
-					transform.rotation = startRot;
+					mousePosOld = screenPos;
 				}
-
-				lastLeftClickTime = Time.time;
 			}
+		}
 
-			float dstWeight = transform.position.magnitude;
-			Vector2 mouseMove = Input.mousePosition - mousePosOld;
-			mousePosOld = Input.mousePosition;
-			float mouseMoveX = mouseMove.x / Screen.width;
-			float mouseMoveY = mouseMove.y / Screen.width;
-			Vector3 move = Vector3.zero;
-
-			if (Input.GetMouseButton(2))
+					// Reset view on double click
+		if (Mouse.current != null && Mouse.current.leftButton.wasPressedThisFrame)
+		{
+			if (Time.time - lastLeftClickTime < 0.2f)
 			{
-				move += Vector3.up * mouseMoveY * -moveSpeed * dstWeight;
-				move += Vector3.right * mouseMoveX * -moveSpeed * dstWeight;
+				transform.position = startPos;
+				transform.rotation = startRot;
 			}
 
-			if (Input.GetMouseButtonDown(0))
+			lastLeftClickTime = Time.time;
+		}
+
+					float dstWeight = transform.position.magnitude;
+		Vector2 currentMousePos = Vector2.zero;
+		if (Mouse.current != null)
+		{
+			Vector2 screenPos = Mouse.current.position.ReadValue();
+			// Only use mouse position if within screen bounds
+			if (screenPos.x >= 0 && screenPos.y >= 0 && screenPos.x <= Screen.width && screenPos.y <= Screen.height)
 			{
-				lastCtrlPivot = transform.position + transform.forward * focusDst;
+				currentMousePos = screenPos;
 			}
+		}
+		Vector2 mouseMove = currentMousePos - mousePosOld;
+		mousePosOld = currentMousePos;
+		float mouseMoveX = mouseMove.x / Screen.width;
+		float mouseMoveY = mouseMove.y / Screen.width;
+		Vector3 move = Vector3.zero;
 
-			if (Input.GetMouseButton(0))
+					if (Mouse.current != null && Mouse.current.middleButton.isPressed)
+		{
+			move += Vector3.up * mouseMoveY * -moveSpeed * dstWeight;
+			move += Vector3.right * mouseMoveX * -moveSpeed * dstWeight;
+		}
+
+					if (Mouse.current != null && Mouse.current.leftButton.wasPressedThisFrame)
+		{
+			lastCtrlPivot = transform.position + transform.forward * focusDst;
+		}
+
+					if (Mouse.current != null && Mouse.current.leftButton.isPressed)
+		{
+			bool isLeftAltPressed = Keyboard.current != null && Keyboard.current.leftAltKey.isPressed;
+			bool isLeftCtrlPressed = Keyboard.current != null && Keyboard.current.leftCtrlKey.isPressed;
+			
+			Vector3 activePivot = isLeftAltPressed ? transform.position : pivot;
+			if (isLeftCtrlPressed)
 			{
-				Vector3 activePivot = Input.GetKey(KeyCode.LeftAlt) ? transform.position : pivot;
-				if (Input.GetKey(KeyCode.LeftControl))
-				{
-					activePivot = lastCtrlPivot;
-				}
-
-				transform.RotateAround(activePivot, transform.right, mouseMoveY * -rotationSpeed);
-				transform.RotateAround(activePivot, Vector3.up, mouseMoveX * rotationSpeed);
+				activePivot = lastCtrlPivot;
 			}
+
+			transform.RotateAround(activePivot, transform.right, mouseMoveY * -rotationSpeed);
+			transform.RotateAround(activePivot, Vector3.up, mouseMoveX * rotationSpeed);
+		}
 
 			transform.Translate(move);
 
-			//Scroll to zoom
-			float mouseScroll = Input.mouseScrollDelta.y;
-			if (Input.GetMouseButtonDown(1))
+					//Scroll to zoom
+		float mouseScroll = Mouse.current != null ? Mouse.current.scroll.ReadValue().y : 0f;
+		if (Mouse.current != null && Mouse.current.rightButton.wasPressedThisFrame)
+		{
+			Vector2 screenPos = Mouse.current.position.ReadValue();
+			// Only use mouse position if within screen bounds
+			if (screenPos.x >= 0 && screenPos.y >= 0 && screenPos.x <= Screen.width && screenPos.y <= Screen.height)
 			{
-				rightClickPos = Input.mousePosition;
+				rightClickPos = screenPos;
 			}
+		}
 
-			if (Input.GetMouseButton(1))
+		if (Mouse.current != null && Mouse.current.rightButton.isPressed)
+		{
+			Vector2 screenPos = Mouse.current.position.ReadValue();
+			// Only use mouse position if within screen bounds
+			if (screenPos.x >= 0 && screenPos.y >= 0 && screenPos.x <= Screen.width && screenPos.y <= Screen.height)
 			{
-				Vector2 delta = (Vector2)Input.mousePosition - rightClickPos;
-				rightClickPos = Input.mousePosition;
+				Vector2 delta = screenPos - rightClickPos;
+				rightClickPos = screenPos;
 				mouseScroll = delta.magnitude * Mathf.Sign(Mathf.Abs(delta.x) > Mathf.Abs(delta.y) ? delta.x : -delta.y) / Screen.width * zoomSpeed * 100;
 			}
+		}
 
 			transform.Translate(Vector3.forward * mouseScroll * zoomSpeed * dstWeight);
 		}
