@@ -1,14 +1,14 @@
 #pragma kernel ExternalForces
 #pragma kernel UpdateSpatialHash
 #pragma kernel Reorder
-#pragma kernel ReorderCopyBack;
+#pragma kernel ReorderCopyBack
 #pragma kernel CalculateDensities
 #pragma kernel CalculatePressureForce
 #pragma kernel CalculateViscosity
 #pragma kernel UpdatePositions
 #pragma kernel UpdateDensityTexture
 #pragma kernel UpdateWhiteParticles
-#pragma kernel WhiteParticlePrepareNextFrame;
+#pragma kernel WhiteParticlePrepareNextFrame
 
 // Includes
 #include "./FluidMaths3D.hlsl"
@@ -45,12 +45,35 @@ const float edgeForce;
 const float edgeForceDst;
 const float3 boundsSize;
 
+// SPHERE SETTINGS
+const float3 sphereCenter;
+const float sphereRadius;
+const bool enableSphereCollision;
+const float3 sphereVelocity;  // Sphere's movement velocity
+
+// BOX SETTINGS
+const float3 boxCenter;
+const float3 boxSize;
+const float3 boxRotation;
+const bool enableBoxCollision;
+const float3 boxVelocity;
+const float boxMass;
+
+// ADD THESE NEW LINES:
+
+
+
+const float sphereMass;
+const bool enableMomentumTransfer;
+
 const float4x4 localToWorld;
 const float4x4 worldToLocal;
 
 const float2 interactionInputPoint;
 const float interactionInputStrength;
 const float interactionInputRadius;
+
+
 
 // Volume texture settings
 RWTexture3D<float> DensityMap;
@@ -98,6 +121,17 @@ float Remap01(float val, float minVal, float maxVal)
     return saturate((val - minVal) / (maxVal - minVal));
 }
 
+float SphereSDF(float3 pos, float3 center, float radius)
+{
+    return length(pos - center) - radius;
+}
+
+float BoxSDF(float3 pos, float3 center, float3 size)
+{
+    float3 d = abs(pos - center) - size * 0.5;
+    return max(d.x, max(d.y, d.z));
+}
+
 void ResolveCollisions(inout float3 pos, inout float3 vel, float collisionDamping)
 {
     // Transform position/velocity to the local space of the bounding box (scale not included)
@@ -108,7 +142,7 @@ void ResolveCollisions(inout float3 pos, inout float3 vel, float collisionDampin
     const float3 halfSize = 0.5;
     const float3 edgeDst = halfSize - abs(posLocal);
 
-    // Resolve collisions
+    // Resolve boundary collisions
     if (edgeDst.x <= 0)
     {
         posLocal.x = halfSize.x * sign(posLocal.x);
@@ -128,6 +162,113 @@ void ResolveCollisions(inout float3 pos, inout float3 vel, float collisionDampin
     // Transform resolved position/velocity back to world space
     pos = mul(localToWorld, float4(posLocal, 1)).xyz;
     vel = mul(localToWorld, float4(velocityLocal, 0)).xyz;
+
+    // ===== PHYSICS-ACCURATE SPHERE COLLISION =====
+    if (enableSphereCollision)
+    {
+        float sphereDist = SphereSDF(pos, sphereCenter, sphereRadius);
+        
+        if (sphereDist < 0) // Inside sphere
+        {
+            // Calculate normal pointing away from sphere center
+            float3 normal = normalize(pos - sphereCenter);
+            
+            // Push particle to sphere surface
+            pos = sphereCenter + normal * sphereRadius;
+            
+            // === REALISTIC VELOCITY CALCULATION ===
+            
+            if (enableMomentumTransfer)
+            {
+                // Advanced: Momentum transfer with moving sphere
+                float3 relativeVel = vel - sphereVelocity;
+                float relativeNormalVel = dot(relativeVel, normal);
+                
+                if (relativeNormalVel < 0) // Approaching in relative terms
+                {
+                    // Calculate momentum transfer
+                    float momentumTransfer = 2 * relativeNormalVel / (1 + sphereMass);
+                    float3 velChange = normal * momentumTransfer;
+                    
+                    // Apply collision
+                    vel = vel - velChange * collisionDamping;
+                }
+            }
+            else
+            {
+                // Simple: Static collision (original behavior)
+                float velNormalMagnitude = dot(vel, normal);
+                float3 velNormal = normal * velNormalMagnitude;
+                float3 velTangential = vel - velNormal;
+                
+                if (velNormalMagnitude < 0) // Moving toward surface
+                {
+                    velNormal *= -1; // Reverse normal component
+                }
+                
+                vel = velNormal * collisionDamping + velTangential * 0.95;
+            }
+        }
+    }
+
+     if (enableBoxCollision)
+    {
+        float boxDist = BoxSDF(pos, boxCenter, boxSize);
+        
+        if (boxDist < 0) // Inside box
+        {
+            // Calculate normal pointing away from closest box face
+            float3 localPos = pos - boxCenter;
+            float3 halfSize = boxSize * 0.5;
+            float3 d = abs(localPos) - halfSize;
+            
+            // Find which face is closest
+            float3 normal;
+            if (d.x > d.y && d.x > d.z) {
+                normal = float3(sign(localPos.x), 0, 0);
+            } else if (d.y > d.z) {
+                normal = float3(0, sign(localPos.y), 0);
+            } else {
+                normal = float3(0, 0, sign(localPos.z));
+            }
+            
+            // Push particle to box surface
+            float3 closestPoint = boxCenter + clamp(localPos, -halfSize, halfSize);
+            pos = closestPoint + normal * 0.01; // Small offset to prevent re-collision
+            
+            // Apply momentum transfer (same logic as sphere)
+            if (enableMomentumTransfer)
+            {
+                // Advanced: Momentum transfer with moving box
+                float3 relativeVel = vel - boxVelocity;
+                float relativeNormalVel = dot(relativeVel, normal);
+                
+                if (relativeNormalVel < 0) // Approaching in relative terms
+                {
+                    // Calculate momentum transfer
+                    float momentumTransfer = 2 * relativeNormalVel / (1 + boxMass);
+                    float3 velChange = normal * momentumTransfer;
+                    
+                    // Apply collision
+                    vel = vel - velChange * collisionDamping;
+                }
+            }
+            else
+            {
+                // Simple: Static collision
+                float velNormalMagnitude = dot(vel, normal);
+                float3 velNormal = normal * velNormalMagnitude;
+                float3 velTangential = vel - velNormal;
+                
+                if (velNormalMagnitude < 0) // Moving toward surface
+                {
+                    velNormal *= -1; // Reverse normal component
+                }
+                
+                vel = velNormal * collisionDamping + velTangential * 0.95;
+            }
+        }
+    }
 }
 
 [numthreads(ThreadGroupSize, 1, 1)]

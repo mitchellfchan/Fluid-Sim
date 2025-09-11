@@ -1,6 +1,6 @@
 using System;
 using UnityEngine;
-using UnityEngine.InputSystem;
+ using UnityEngine.InputSystem;
 using Seb.GPUSorting;
 using Unity.Mathematics;
 using System.Collections.Generic;
@@ -25,6 +25,29 @@ namespace Seb.Fluid.Simulation
 		public float nearPressureMultiplier = 2.15f;
 		public float viscosityStrength = 0;
 		[Range(0, 1)] public float collisionDamping = 0.95f;
+
+		[Header("Collision Objects")]
+		public bool enableSphereCollision = true;
+		public Transform sphereCollider;
+		public float sphereRadius = 1.0f;
+
+		// BOX COLLISION FIELDS:
+		[Header("Box Collision")]
+		public bool enableBoxCollision = false;
+		public Transform boxCollider;
+		public Vector3 boxSize = Vector3.one;
+		public float boxMass = 1.0f;
+
+		[Header("Dynamic Collision Physics")]
+		public bool enableMomentumTransfer = true;
+		public float sphereMass = 1.0f;
+
+		// Private fields to track velocity
+		private Vector3 lastSpherePosition;
+		private Vector3 sphereVelocity;
+		private Vector3 lastBoxPosition;
+	private Vector3 boxVelocity;
+		private bool isFirstFrame = true;
 
 		[Header("Foam Settings")] public bool foamActive;
 		public int maxFoamParticleCount = 1000;
@@ -353,6 +376,8 @@ namespace Seb.Fluid.Simulation
 
 		void UpdateSettings(float stepDeltaTime, float frameDeltaTime)
 		{
+
+
 			if (smoothingRadius != smoothRadiusOld)
 			{
 				smoothRadiusOld = smoothingRadius;
@@ -387,6 +412,82 @@ namespace Seb.Fluid.Simulation
 			compute.SetInt("bubbleClassifyMinNeighbours", bubbleClassifyMinNeighbours);
 			compute.SetFloat("bubbleScaleChangeSpeed", bubbleChangeScaleSpeed);
 			compute.SetFloat("bubbleScale", bubbleScale);
+
+
+
+			// Collision object settings - calculate sphere velocity
+			Vector3 sphereCenter = sphereCollider != null ? sphereCollider.position : Vector3.zero;
+
+			// Calculate sphere velocity
+			if (sphereCollider != null)
+			{
+				if (isFirstFrame)
+				{
+					lastSpherePosition = sphereCenter;
+					sphereVelocity = Vector3.zero;
+					isFirstFrame = false;
+				}
+				else
+				{
+					// Calculate velocity based on position change
+					float deltaTime = Time.deltaTime;
+					if (deltaTime > 0)
+					{
+						sphereVelocity = (sphereCenter - lastSpherePosition) / deltaTime;
+					}
+					lastSpherePosition = sphereCenter;
+				}
+			}
+			else
+			{
+				sphereVelocity = Vector3.zero;
+			}
+
+			// Send collision data to compute shader
+			compute.SetVector("sphereCenter", sphereCenter);
+			compute.SetFloat("sphereRadius", sphereRadius);
+			compute.SetBool("enableSphereCollision", enableSphereCollision);
+			compute.SetVector("sphereVelocity", sphereVelocity);
+			compute.SetFloat("sphereMass", sphereMass);
+			compute.SetBool("enableMomentumTransfer", enableMomentumTransfer);
+		
+		// ===== ADD BOX COLLISION CODE HERE =====
+		
+		// Box collision settings - calculate box velocity
+		Vector3 boxCenter = boxCollider != null ? boxCollider.position : Vector3.zero;
+		Vector3 boxRotation = boxCollider != null ? boxCollider.eulerAngles : Vector3.zero;
+
+		// Calculate box velocity
+		if (boxCollider != null)
+		{
+			if (isFirstFrame)
+			{
+				lastBoxPosition = boxCenter;
+				boxVelocity = Vector3.zero;
+			}
+			else
+			{
+				// Calculate velocity based on position change
+				float deltaTime = Time.deltaTime;
+				if (deltaTime > 0)
+				{
+					boxVelocity = (boxCenter - lastBoxPosition) / deltaTime;
+				}
+				lastBoxPosition = boxCenter;
+			}
+		}
+		else
+		{
+			boxVelocity = Vector3.zero;
+		}
+
+		// Send box collision data to compute shader
+		compute.SetVector("boxCenter", boxCenter);
+		compute.SetVector("boxSize", boxSize);
+		compute.SetVector("boxRotation", boxRotation);
+		compute.SetBool("enableBoxCollision", enableBoxCollision);
+		compute.SetVector("boxVelocity", boxVelocity);
+		compute.SetFloat("boxMass", boxMass);
 		}
 
 		void SetInitialBufferData(Spawner3D.SpawnData spawnData)
