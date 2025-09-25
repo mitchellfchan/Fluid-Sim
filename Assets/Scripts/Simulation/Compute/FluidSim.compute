@@ -45,26 +45,43 @@ const float edgeForce;
 const float edgeForceDst;
 const float3 boundsSize;
 
-// SPHERE SETTINGS
-const float3 sphereCenter;
-const float sphereRadius;
-const bool enableSphereCollision;
-const float3 sphereVelocity;  // Sphere's movement velocity
+// Collision objects
+struct GPUCollisionObject
+{
+    float3 position;             // 12 bytes
+    float radius;                // 4 bytes
+    
+    float3 velocity;             // 12 bytes  
+    int shapeType;               // 4 bytes (CollisionShape as int)
+    
+    float3 size;                 // 12 bytes
+    float mass;                  // 4 bytes
+    
+    float bounciness;            // 4 bytes
+    float friction;              // 4 bytes
+    float enableMomentumTransfer; // 4 bytes (bool as float)
+    float isActive;              // 4 bytes (bool as float)
+    
+    // Rotation and angular velocity support
+    float4x4 rotationMatrix;    // 64 bytes - full transform matrix
+    float3 angularVelocity;      // 12 bytes - rotation speed (radians/second)
+    float3 rotationCenter;       // 12 bytes - true pivot point for rotation
+    float padding;               // 4 bytes - keep 16-byte alignment
+    // Total: 156 bytes
+};
 
-// BOX SETTINGS
-const float3 boxCenter;
-const float3 boxSize;
-const float3 boxRotation;
-const bool enableBoxCollision;
-const float3 boxVelocity;
-const float boxMass;
+// Collision object buffer and settings
+StructuredBuffer<GPUCollisionObject> CollisionObjects;
+const uint numCollisionObjects;
+const uint maxCollisionObjects;
 
-// ADD THESE NEW LINES:
-
-
-
-const float sphereMass;
-const bool enableMomentumTransfer;
+// Shape type constants (must match C# CollisionShape enum)
+static const int SHAPE_NONE = 0;
+static const int SHAPE_SPHERE = 1;
+static const int SHAPE_BOX = 2;
+static const int SHAPE_CYLINDER = 3;
+static const int SHAPE_CAPSULE = 4;
+static const int SHAPE_COMPOSITE = 5;
 
 const float4x4 localToWorld;
 const float4x4 worldToLocal;
@@ -121,6 +138,8 @@ float Remap01(float val, float minVal, float maxVal)
     return saturate((val - minVal) / (maxVal - minVal));
 }
 
+// ===== UNIFIED SDF FUNCTIONS =====
+
 float SphereSDF(float3 pos, float3 center, float radius)
 {
     return length(pos - center) - radius;
@@ -132,13 +151,245 @@ float BoxSDF(float3 pos, float3 center, float3 size)
     return max(d.x, max(d.y, d.z));
 }
 
+float CapsuleSDF(float3 pos, float3 pointA, float3 pointB, float radius)
+{
+    float3 pa = pos - pointA;
+    float3 ba = pointB - pointA;
+    float h = saturate(dot(pa, ba) / dot(ba, ba));
+    return length(pa - ba * h) - radius;
+}
+
+float CylinderSDF(float3 pos, float3 pointA, float3 pointB, float radius)
+{
+    float3 pa = pos - pointA;
+    float3 ba = pointB - pointA;
+    float h = dot(pa, ba) / dot(ba, ba); // No saturate - allows extending beyond caps
+    
+    // Distance to infinite cylinder axis
+    float radialDist = length(pa - ba * h) - radius;
+    
+    // Distance to caps (flat ends)
+    float capDist = abs(h - 0.5) - 0.5; // Distance beyond normalized height range
+    capDist *= length(ba); // Scale back to world units
+    
+    // Combine: inside cylinder if both radial and cap distances are negative
+    return max(radialDist, capDist);
+}
+
+// Calculate SDF distance for any collision object
+float CalculateObjectSDF(float3 pos, GPUCollisionObject obj)
+{
+    if (obj.shapeType == SHAPE_SPHERE)
+    {
+        return SphereSDF(pos, obj.position, obj.radius);
+    }
+    else if (obj.shapeType == SHAPE_BOX)
+    {
+        // Transform position to box's local space
+        // Since we're only using rotation (no scaling), transpose = inverse for rotation matrix
+        float3 worldOffset = pos - obj.position;
+        float3 localPos = mul(transpose((float3x3)obj.rotationMatrix), worldOffset);
+        return BoxSDF(localPos, float3(0, 0, 0), obj.size);
+    }
+    else if (obj.shapeType == SHAPE_CYLINDER)
+    {
+        // For cylinder: size.x is height, radius is radius
+        float height = obj.size.x;
+        float halfHeight = height * 0.5;
+        
+        // Apply rotation to get properly oriented cylinder axis
+        float3 localUp = mul((float3x3)obj.rotationMatrix, float3(0, 1, 0));
+        float3 pointA = obj.position - localUp * halfHeight; // Bottom
+        float3 pointB = obj.position + localUp * halfHeight; // Top
+        return CylinderSDF(pos, pointA, pointB, obj.radius);
+    }
+    else if (obj.shapeType == SHAPE_CAPSULE)
+    {
+        // For capsule: size.x is TOTAL height (including hemisphere caps)
+        // Cylinder height = totalHeight - 2*radius
+        float totalHeight = obj.size.x;
+        float cylinderHeight = max(0.0, totalHeight - 2.0 * obj.radius);
+        float halfCylinderHeight = cylinderHeight * 0.5;
+        
+        // Apply rotation to get properly oriented capsule axis
+        float3 localUp = mul((float3x3)obj.rotationMatrix, float3(0, 1, 0));
+        float3 pointA = obj.position - localUp * halfCylinderHeight; // Bottom of cylinder
+        float3 pointB = obj.position + localUp * halfCylinderHeight; // Top of cylinder
+        return CapsuleSDF(pos, pointA, pointB, obj.radius);
+    }
+    // Add more shapes here in the future
+    return 1000.0; // Far outside for unknown shapes
+}
+
+// Calculate surface normal for any collision object
+float3 CalculateObjectNormal(float3 pos, GPUCollisionObject obj)
+{
+    if (obj.shapeType == SHAPE_SPHERE)
+    {
+        return normalize(pos - obj.position);
+    }
+    else if (obj.shapeType == SHAPE_BOX)
+    {
+        // Box normal calculation with rotation
+        // Transform position to box's local space
+        float3 worldOffset = pos - obj.position;
+        float3 localPos = mul(transpose((float3x3)obj.rotationMatrix), worldOffset);
+        float3 halfSize = obj.size * 0.5;
+        float3 d = abs(localPos) - halfSize;
+        
+        // Find which face is closest in local space
+        float3 localNormal;
+        if (d.x > d.y && d.x > d.z) {
+            localNormal = float3(sign(localPos.x), 0, 0);
+        } else if (d.y > d.z) {
+            localNormal = float3(0, sign(localPos.y), 0);
+        } else {
+            localNormal = float3(0, 0, sign(localPos.z));
+        }
+        
+        // Transform normal back to world space
+        return mul((float3x3)obj.rotationMatrix, localNormal);
+    }
+    else if (obj.shapeType == SHAPE_CYLINDER)
+    {
+        // Cylinder normal calculation with rotation
+        float height = obj.size.x;
+        float halfHeight = height * 0.5;
+        
+        // Apply rotation to get properly oriented cylinder axis
+        float3 localUp = mul((float3x3)obj.rotationMatrix, float3(0, 1, 0));
+        float3 pointA = obj.position - localUp * halfHeight; // Bottom
+        float3 pointB = obj.position + localUp * halfHeight; // Top
+        
+        float3 pa = pos - pointA;
+        float3 ba = pointB - pointA;
+        float h = dot(pa, ba) / dot(ba, ba);
+        
+        // Check if we're hitting the caps or the curved surface
+        if (h < 0.0)
+        {
+            // Bottom cap - normal points down along local axis
+            return -localUp;
+        }
+        else if (h > 1.0)
+        {
+            // Top cap - normal points up along local axis
+            return localUp;
+        }
+        else
+        {
+            // Curved surface - radial direction
+            float3 closestPoint = pointA + ba * h;
+            float3 radial = pos - closestPoint;
+            return normalize(radial);
+        }
+    }
+    else if (obj.shapeType == SHAPE_CAPSULE)
+    {
+        // Capsule normal calculation with rotation
+        float totalHeight = obj.size.x;
+        float cylinderHeight = max(0.0, totalHeight - 2.0 * obj.radius);
+        float halfCylinderHeight = cylinderHeight * 0.5;
+        
+        // Apply rotation to get properly oriented capsule axis
+        float3 localUp = mul((float3x3)obj.rotationMatrix, float3(0, 1, 0));
+        float3 pointA = obj.position - localUp * halfCylinderHeight; // Bottom of cylinder
+        float3 pointB = obj.position + localUp * halfCylinderHeight; // Top of cylinder
+        
+        float3 pa = pos - pointA;
+        float3 ba = pointB - pointA;
+        float h = saturate(dot(pa, ba) / dot(ba, ba));
+        float3 closestPoint = pointA + ba * h;
+        
+        return normalize(pos - closestPoint);
+    }
+    return float3(0, 1, 0); // Default up normal
+}
+
+// Push particle to object surface
+float3 PushToSurface(float3 pos, GPUCollisionObject obj, float3 normal)
+{
+    if (obj.shapeType == SHAPE_SPHERE)
+    {
+        return obj.position + normal * obj.radius;
+    }
+    else if (obj.shapeType == SHAPE_BOX)
+    {
+        // Transform position to box's local space (same as SDF calculation)
+        float3 worldOffset = pos - obj.position;
+        float3 localPos = mul(transpose((float3x3)obj.rotationMatrix), worldOffset);
+        float3 halfSize = obj.size * 0.5;
+        
+        // Find closest point on box in local space
+        float3 localClosest = clamp(localPos, -halfSize, halfSize);
+        
+        // Transform back to world space
+        float3 worldClosest = mul((float3x3)obj.rotationMatrix, localClosest) + obj.position;
+        
+        return worldClosest + normal * 0.01; // Small offset
+    }
+    else if (obj.shapeType == SHAPE_CYLINDER)
+    {
+        // For cylinder, push to surface with rotation
+        float height = obj.size.x;
+        float halfHeight = height * 0.5;
+        
+        // Apply rotation to get properly oriented cylinder axis
+        float3 localUp = mul((float3x3)obj.rotationMatrix, float3(0, 1, 0));
+        float3 pointA = obj.position - localUp * halfHeight;
+        float3 pointB = obj.position + localUp * halfHeight;
+        
+        float3 pa = pos - pointA;
+        float3 ba = pointB - pointA;
+        float h = dot(pa, ba) / dot(ba, ba);
+        
+        // Push based on which surface we're hitting
+        if (h < 0.0)
+        {
+            // Bottom cap - push down along local axis
+            return pointA - localUp * 0.01;
+        }
+        else if (h > 1.0)
+        {
+            // Top cap - push up along local axis
+            return pointB + localUp * 0.01;
+        }
+        else
+        {
+            // Curved surface - push radially
+            float3 closestPoint = pointA + ba * h;
+            return closestPoint + normal * obj.radius;
+        }
+    }
+    else if (obj.shapeType == SHAPE_CAPSULE)
+    {
+        // For capsule, push along the normal direction with rotation
+        float totalHeight = obj.size.x;
+        float cylinderHeight = max(0.0, totalHeight - 2.0 * obj.radius);
+        float halfCylinderHeight = cylinderHeight * 0.5;
+        
+        // Apply rotation to get properly oriented capsule axis
+        float3 localUp = mul((float3x3)obj.rotationMatrix, float3(0, 1, 0));
+        float3 pointA = obj.position - localUp * halfCylinderHeight;
+        float3 pointB = obj.position + localUp * halfCylinderHeight;
+        
+        float3 pa = pos - pointA;
+        float3 ba = pointB - pointA;
+        float h = saturate(dot(pa, ba) / dot(ba, ba));
+        float3 closestPoint = pointA + ba * h;
+        
+        return closestPoint + normal * obj.radius;
+    }
+    return pos; // No change for unknown shapes
+}
+
+// ===== MODERN COLLISION RESOLUTION =====
 void ResolveCollisions(inout float3 pos, inout float3 vel, float collisionDamping)
 {
-    // Transform position/velocity to the local space of the bounding box (scale not included)
+    // 1. Handle boundary collisions (existing code)
     float3 posLocal = mul(worldToLocal, float4(pos, 1)).xyz;
     float3 velocityLocal = mul(worldToLocal, float4(vel, 0)).xyz;
 
-    // Calculate distance from box on each axis (negative values are inside box)
     const float3 halfSize = 0.5;
     const float3 edgeDst = halfSize - abs(posLocal);
 
@@ -159,98 +410,47 @@ void ResolveCollisions(inout float3 pos, inout float3 vel, float collisionDampin
         velocityLocal.z *= -1 * collisionDamping;
     }
 
-    // Transform resolved position/velocity back to world space
     pos = mul(localToWorld, float4(posLocal, 1)).xyz;
     vel = mul(localToWorld, float4(velocityLocal, 0)).xyz;
 
-    // ===== PHYSICS-ACCURATE SPHERE COLLISION =====
-    if (enableSphereCollision)
+    // 2. Handle collision objects (NEW UNIFIED SYSTEM)
+    for (uint i = 0; i < numCollisionObjects; i++)
     {
-        float sphereDist = SphereSDF(pos, sphereCenter, sphereRadius);
+        GPUCollisionObject obj = CollisionObjects[i];
         
-        if (sphereDist < 0) // Inside sphere
+        // Skip inactive objects
+        if (obj.isActive < 0.5) continue;
+        
+        // Calculate distance to object
+        float objDist = CalculateObjectSDF(pos, obj);
+        
+        if (objDist < 0) // Inside object
         {
-            // Calculate normal pointing away from sphere center
-            float3 normal = normalize(pos - sphereCenter);
+            // Calculate surface normal
+            float3 normal = CalculateObjectNormal(pos, obj);
             
-            // Push particle to sphere surface
-            pos = sphereCenter + normal * sphereRadius;
+            // Push particle to surface
+            pos = PushToSurface(pos, obj, normal);
             
-            // === REALISTIC VELOCITY CALCULATION ===
-            
-            if (enableMomentumTransfer)
+            // Apply physics (momentum transfer or simple bounce)
+            if (obj.enableMomentumTransfer > 0.5)
             {
-                // Advanced: Momentum transfer with moving sphere
-                float3 relativeVel = vel - sphereVelocity;
+                // ===== REAL ROTATIONAL MOMENTUM TRANSFER =====
+                
+                // Calculate point velocity on rotating object surface using TRUE rotation center
+                float3 relativePos = pos - obj.rotationCenter;  // Use correct pivot point!
+                float3 rotationalVelocity = cross(obj.angularVelocity, relativePos);
+                float3 totalObjectVelocity = obj.velocity + rotationalVelocity;
+                
+                // Use point-specific velocity for momentum transfer
+                float3 relativeVel = vel - totalObjectVelocity;
                 float relativeNormalVel = dot(relativeVel, normal);
                 
-                if (relativeNormalVel < 0) // Approaching in relative terms
+                if (relativeNormalVel < 0) // Approaching surface
                 {
-                    // Calculate momentum transfer
-                    float momentumTransfer = 2 * relativeNormalVel / (1 + sphereMass);
+                    float momentumTransfer = 2 * relativeNormalVel / (1 + obj.mass);
                     float3 velChange = normal * momentumTransfer;
-                    
-                    // Apply collision
-                    vel = vel - velChange * collisionDamping;
-                }
-            }
-            else
-            {
-                // Simple: Static collision (original behavior)
-                float velNormalMagnitude = dot(vel, normal);
-                float3 velNormal = normal * velNormalMagnitude;
-                float3 velTangential = vel - velNormal;
-                
-                if (velNormalMagnitude < 0) // Moving toward surface
-                {
-                    velNormal *= -1; // Reverse normal component
-                }
-                
-                vel = velNormal * collisionDamping + velTangential * 0.95;
-            }
-        }
-    }
-
-     if (enableBoxCollision)
-    {
-        float boxDist = BoxSDF(pos, boxCenter, boxSize);
-        
-        if (boxDist < 0) // Inside box
-        {
-            // Calculate normal pointing away from closest box face
-            float3 localPos = pos - boxCenter;
-            float3 halfSize = boxSize * 0.5;
-            float3 d = abs(localPos) - halfSize;
-            
-            // Find which face is closest
-            float3 normal;
-            if (d.x > d.y && d.x > d.z) {
-                normal = float3(sign(localPos.x), 0, 0);
-            } else if (d.y > d.z) {
-                normal = float3(0, sign(localPos.y), 0);
-            } else {
-                normal = float3(0, 0, sign(localPos.z));
-            }
-            
-            // Push particle to box surface
-            float3 closestPoint = boxCenter + clamp(localPos, -halfSize, halfSize);
-            pos = closestPoint + normal * 0.01; // Small offset to prevent re-collision
-            
-            // Apply momentum transfer (same logic as sphere)
-            if (enableMomentumTransfer)
-            {
-                // Advanced: Momentum transfer with moving box
-                float3 relativeVel = vel - boxVelocity;
-                float relativeNormalVel = dot(relativeVel, normal);
-                
-                if (relativeNormalVel < 0) // Approaching in relative terms
-                {
-                    // Calculate momentum transfer
-                    float momentumTransfer = 2 * relativeNormalVel / (1 + boxMass);
-                    float3 velChange = normal * momentumTransfer;
-                    
-                    // Apply collision
-                    vel = vel - velChange * collisionDamping;
+                    vel = vel - velChange * obj.bounciness;
                 }
             }
             else
@@ -265,7 +465,7 @@ void ResolveCollisions(inout float3 pos, inout float3 vel, float collisionDampin
                     velNormal *= -1; // Reverse normal component
                 }
                 
-                vel = velNormal * collisionDamping + velTangential * 0.95;
+                vel = velNormal * obj.bounciness + velTangential * obj.friction;
             }
         }
     }

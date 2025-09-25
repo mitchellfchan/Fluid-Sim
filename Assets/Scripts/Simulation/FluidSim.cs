@@ -26,27 +26,17 @@ namespace Seb.Fluid.Simulation
 		public float viscosityStrength = 0;
 		[Range(0, 1)] public float collisionDamping = 0.95f;
 
-		[Header("Collision Objects")]
-		public bool enableSphereCollision = true;
-		public Transform sphereCollider;
-		public float sphereRadius = 1.0f;
+		[Header("Collision Objects System")]
+		[Range(1, 64)] public int maxCollisionObjects = 16;
+		[SerializeField] private List<CollisionObject> collisionObjects = new List<CollisionObject>();
 
-		// BOX COLLISION FIELDS:
-		[Header("Box Collision")]
-		public bool enableBoxCollision = false;
-		public Transform boxCollider;
-		public Vector3 boxSize = Vector3.one;
-		public float boxMass = 1.0f;
-
-		[Header("Dynamic Collision Physics")]
-		public bool enableMomentumTransfer = true;
-		public float sphereMass = 1.0f;
-
-		// Private fields to track velocity
-		private Vector3 lastSpherePosition;
-		private Vector3 sphereVelocity;
-		private Vector3 lastBoxPosition;
-	private Vector3 boxVelocity;
+		// Private collision system data
+		private ComputeBuffer collisionObjectBuffer;
+		private GPUCollisionObject[] gpuCollisionObjects;
+		private Vector3[] lastPositions;
+		private Vector3[] velocities;
+		private Vector3[] lastRotations;     // Track rotation changes
+		private Vector3[] angularVelocities; // Calculated angular velocities
 		private bool isFirstFrame = true;
 
 		[Header("Foam Settings")] public bool foamActive;
@@ -115,6 +105,7 @@ namespace Seb.Fluid.Simulation
 			isPaused = false;
 
 			Initialize();
+			InitializeCollisionSystem();
 		}
 
 		void Initialize()
@@ -286,6 +277,18 @@ namespace Seb.Fluid.Simulation
 			SimulationInitCompleted?.Invoke(this);
 		}
 
+		private void InitializeCollisionSystem()
+		{
+			// Create collision object buffer
+			gpuCollisionObjects = new GPUCollisionObject[maxCollisionObjects];
+			collisionObjectBuffer = new ComputeBuffer(maxCollisionObjects, System.Runtime.InteropServices.Marshal.SizeOf<GPUCollisionObject>());
+			
+			// Initialize tracking arrays
+			InitializeCollisionObjectTracking();
+		}
+
+		
+
 		void Update()
 		{
 			// Run simulation
@@ -415,80 +418,130 @@ namespace Seb.Fluid.Simulation
 
 
 
-			// Collision object settings - calculate sphere velocity
-			Vector3 sphereCenter = sphereCollider != null ? sphereCollider.position : Vector3.zero;
+			UpdateCollisionObjects();
+			UploadCollisionObjectsToGPU();
+		}
 
-			// Calculate sphere velocity
-			if (sphereCollider != null)
+		
+	private void UpdateCollisionObjects()
+	{
+		float deltaTime = Time.deltaTime;
+		
+		for (int i = 0; i < collisionObjects.Count; i++)
+		{
+			var obj = collisionObjects[i];
+			
+			// Update position from transform
+			if (obj.transform != null)
 			{
-				if (isFirstFrame)
+				Vector3 currentPosition = obj.transform.position;
+				obj.position = currentPosition;
+				
+				// Calculate velocity
+				if (!isFirstFrame && deltaTime > 0)
 				{
-					lastSpherePosition = sphereCenter;
-					sphereVelocity = Vector3.zero;
-					isFirstFrame = false;
+					velocities[i] = (currentPosition - lastPositions[i]) / deltaTime;
 				}
 				else
 				{
-					// Calculate velocity based on position change
-					float deltaTime = Time.deltaTime;
-					if (deltaTime > 0)
-					{
-						sphereVelocity = (sphereCenter - lastSpherePosition) / deltaTime;
-					}
-					lastSpherePosition = sphereCenter;
+					velocities[i] = Vector3.zero;
 				}
-			}
-			else
-			{
-				sphereVelocity = Vector3.zero;
-			}
-
-			// Send collision data to compute shader
-			compute.SetVector("sphereCenter", sphereCenter);
-			compute.SetFloat("sphereRadius", sphereRadius);
-			compute.SetBool("enableSphereCollision", enableSphereCollision);
-			compute.SetVector("sphereVelocity", sphereVelocity);
-			compute.SetFloat("sphereMass", sphereMass);
-			compute.SetBool("enableMomentumTransfer", enableMomentumTransfer);
-		
-		// ===== ADD BOX COLLISION CODE HERE =====
-		
-		// Box collision settings - calculate box velocity
-		Vector3 boxCenter = boxCollider != null ? boxCollider.position : Vector3.zero;
-		Vector3 boxRotation = boxCollider != null ? boxCollider.eulerAngles : Vector3.zero;
-
-		// Calculate box velocity
-		if (boxCollider != null)
-		{
-			if (isFirstFrame)
-			{
-				lastBoxPosition = boxCenter;
-				boxVelocity = Vector3.zero;
-			}
-			else
-			{
-				// Calculate velocity based on position change
-				float deltaTime = Time.deltaTime;
-				if (deltaTime > 0)
+				
+				obj.velocity = velocities[i];
+				lastPositions[i] = currentPosition;
+				
+				// Calculate angular velocity from rotation changes
+				Vector3 currentRotation = obj.transform.eulerAngles;
+				obj.rotation = currentRotation;
+				
+				if (!isFirstFrame && deltaTime > 0)
 				{
-					boxVelocity = (boxCenter - lastBoxPosition) / deltaTime;
+					// Calculate rotation difference (handling angle wrapping)
+					Vector3 rotationDiff = currentRotation - lastRotations[i];
+					
+					// Handle angle wrapping (e.g., 350° to 10° = 20° change, not -340°)
+					if (rotationDiff.x > 180f) rotationDiff.x -= 360f;
+					if (rotationDiff.x < -180f) rotationDiff.x += 360f;
+					if (rotationDiff.y > 180f) rotationDiff.y -= 360f;
+					if (rotationDiff.y < -180f) rotationDiff.y += 360f;
+					if (rotationDiff.z > 180f) rotationDiff.z -= 360f;
+					if (rotationDiff.z < -180f) rotationDiff.z += 360f;
+					
+					// Convert to radians/second
+					angularVelocities[i] = rotationDiff * Mathf.Deg2Rad / deltaTime;
 				}
-				lastBoxPosition = boxCenter;
+				else
+				{
+					angularVelocities[i] = Vector3.zero;
+				}
+				
+				obj.angularVelocity = angularVelocities[i];
+				lastRotations[i] = currentRotation;
+				
+				// ===== AUTOMATIC SCALE DETECTION =====
+				Vector3 scale = obj.transform.localScale;
+				
+				if (obj.shapeType == CollisionShape.Sphere)
+				{
+					// For spheres, use the largest scale component as radius multiplier
+					float maxScale = Mathf.Max(scale.x, Mathf.Max(scale.y, scale.z));
+					obj.radius = obj.baseRadius * maxScale;
+				}
+				else if (obj.shapeType == CollisionShape.Box)
+				{
+					// For boxes, apply scale directly to each dimension
+					obj.size = Vector3.Scale(obj.baseSize, scale);
+					
+					// Update rotation for boxes
+					obj.rotation = obj.transform.eulerAngles;
+				}
+				else if (obj.shapeType == CollisionShape.Cylinder)
+				{
+					// For cylinders, scale height with Y and radius with max of X/Z
+					float radiusScale = Mathf.Max(scale.x, scale.z);
+					obj.radius = obj.baseRadius * radiusScale;
+					obj.size = new Vector3(obj.baseSize.x * scale.y, 0, 0); // Height in size.x
+					
+					// Update rotation for cylinders
+					obj.rotation = obj.transform.eulerAngles;
+				}
+				else if (obj.shapeType == CollisionShape.Capsule)
+				{
+					// For capsules, scale height with Y and radius with max of X/Z
+					float radiusScale = Mathf.Max(scale.x, scale.z);
+					obj.radius = obj.baseRadius * radiusScale;
+					obj.size = new Vector3(obj.baseSize.x * scale.y, 0, 0); // Height in size.x
+					
+					// Update rotation for capsules (important for pinball paddles!)
+					obj.rotation = obj.transform.eulerAngles;
+				}
 			}
+			
+			// Update the object in the list
+			collisionObjects[i] = obj;
 		}
-		else
-		{
-			boxVelocity = Vector3.zero;
-		}
+		
+		isFirstFrame = false;
+	}
 
-		// Send box collision data to compute shader
-		compute.SetVector("boxCenter", boxCenter);
-		compute.SetVector("boxSize", boxSize);
-		compute.SetVector("boxRotation", boxRotation);
-		compute.SetBool("enableBoxCollision", enableBoxCollision);
-		compute.SetVector("boxVelocity", boxVelocity);
-		compute.SetFloat("boxMass", boxMass);
+	private void UploadCollisionObjectsToGPU()
+	{
+		// Clear GPU array
+		System.Array.Clear(gpuCollisionObjects, 0, maxCollisionObjects);
+		
+		// Convert active collision objects to GPU format
+		for (int i = 0; i < collisionObjects.Count; i++)
+		{
+			gpuCollisionObjects[i] = GPUCollisionObject.FromCollisionObject(collisionObjects[i]);
 		}
+		
+		// Upload to GPU
+		collisionObjectBuffer.SetData(gpuCollisionObjects);
+		compute.SetBuffer(externalForcesKernel, "CollisionObjects", collisionObjectBuffer);
+		compute.SetBuffer(updatePositionsKernel, "CollisionObjects", collisionObjectBuffer);
+		compute.SetInt("numCollisionObjects", collisionObjects.Count);
+		compute.SetInt("maxCollisionObjects", maxCollisionObjects);
+	}
 
 		void SetInitialBufferData(Spawner3D.SpawnData spawnData)
 		{
@@ -547,7 +600,93 @@ namespace Seb.Fluid.Simulation
 			}
 
 			spatialHash.Release();
+			collisionObjectBuffer?.Release();
 		}
+
+		#region Collision Object Management
+		public bool AddCollisionObject(CollisionObject obj)
+		{
+			if (collisionObjects.Count >= maxCollisionObjects)
+			{
+				Debug.LogWarning($"Cannot add collision object: Maximum {maxCollisionObjects} objects reached!");
+				return false;
+			}
+			
+			collisionObjects.Add(obj);
+			InitializeCollisionObjectTracking();
+			return true;
+		}
+
+		public bool RemoveCollisionObject(CollisionObject obj)
+		{
+			bool removed = collisionObjects.Remove(obj);
+			if (removed)
+			{
+				InitializeCollisionObjectTracking();
+			}
+			return removed;
+		}
+
+		public bool RemoveCollisionObjectAt(int index)
+		{
+			if (index >= 0 && index < collisionObjects.Count)
+			{
+				collisionObjects.RemoveAt(index);
+				InitializeCollisionObjectTracking();
+				return true;
+			}
+			return false;
+		}
+
+		public void ClearAllCollisionObjects()
+		{
+			collisionObjects.Clear();
+			InitializeCollisionObjectTracking();
+		}
+
+		public CollisionObject GetCollisionObject(int index)
+		{
+			if (index >= 0 && index < collisionObjects.Count)
+				return collisionObjects[index];
+			return default;
+		}
+
+		public int GetCollisionObjectCount() => collisionObjects.Count;
+		public int GetMaxCollisionObjects() => maxCollisionObjects;
+		
+		public void UpdateCollisionObjectAt(int index, CollisionObject newObj)
+		{
+			if (index >= 0 && index < collisionObjects.Count)
+			{
+				collisionObjects[index] = newObj;
+			}
+		}
+
+		private void InitializeCollisionObjectTracking()
+		{
+			// Resize tracking arrays if needed
+			if (lastPositions == null || lastPositions.Length != maxCollisionObjects)
+			{
+				lastPositions = new Vector3[maxCollisionObjects];
+				velocities = new Vector3[maxCollisionObjects];
+				lastRotations = new Vector3[maxCollisionObjects];
+				angularVelocities = new Vector3[maxCollisionObjects];
+			}
+			
+			// Initialize positions and rotations for new objects
+			for (int i = 0; i < collisionObjects.Count; i++)
+			{
+				if (collisionObjects[i].transform != null)
+				{
+					lastPositions[i] = collisionObjects[i].transform.position;
+					velocities[i] = Vector3.zero;
+					lastRotations[i] = collisionObjects[i].transform.eulerAngles;
+					angularVelocities[i] = Vector3.zero;
+				}
+			}
+		}
+
+		#endregion
 
 
 		public struct FoamParticle
