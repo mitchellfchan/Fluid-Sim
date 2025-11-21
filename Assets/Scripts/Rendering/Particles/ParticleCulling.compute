@@ -1,0 +1,48 @@
+#pragma kernel CullParticles
+
+// Input buffers
+StructuredBuffer<float3> AllPositions;
+RWStructuredBuffer<uint> VisibleIndices;
+RWStructuredBuffer<uint> VisibleCount;
+
+// Camera frustum planes (6 planes: left, right, bottom, top, near, far)
+float4 FrustumPlanes[6];
+float3 CameraPosition;
+float ParticleRadius;
+float MaxRenderDistance;
+uint MaxParticleCount;
+
+[numthreads(64, 1, 1)]
+void CullParticles(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= MaxParticleCount) return;
+    
+    float3 particlePos = AllPositions[id.x];
+    
+    // Distance culling
+    float distanceToCamera = length(particlePos - CameraPosition);
+    if (distanceToCamera > MaxRenderDistance) return;
+    
+    // Frustum culling - test particle sphere against all 6 frustum planes
+    bool insideFrustum = true;
+    for (int i = 0; i < 6; i++)
+    {
+        float4 plane = FrustumPlanes[i];
+        float distance = dot(plane.xyz, particlePos) + plane.w;
+        if (distance < -ParticleRadius)
+        {
+            insideFrustum = false;
+            break;
+        }
+    }
+    
+    if (insideFrustum)
+    {
+        uint index;
+        InterlockedAdd(VisibleCount[0], 1, index);
+        if (index < MaxParticleCount)
+        {
+            VisibleIndices[index] = id.x;
+        }
+    }
+}

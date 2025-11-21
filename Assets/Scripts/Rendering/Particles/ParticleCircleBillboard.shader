@@ -1,6 +1,7 @@
-Shader "Fluid/ParticleBillboard" {
+Shader "Fluid/ParticleCircleBillboard" {
 	Properties {
-		
+		_ShadowIntensity ("Shadow Intensity", Range(0, 1)) = 0.9
+		_ShadowColor ("Shadow Color", Color) = (0.01, 0.02, 0.05, 1)
 	}
 	SubShader {
 
@@ -15,6 +16,9 @@ Shader "Fluid/ParticleBillboard" {
 			#pragma target 4.5
 
 			#include "UnityCG.cginc"
+			
+			// Manually declare the main light direction (we'll set this from C#)
+			float3 _MainLightDirection;
 			
 			StructuredBuffer<float3> Positions;
 			StructuredBuffer<float3> Velocities;
@@ -31,6 +35,10 @@ Shader "Fluid/ParticleBillboard" {
 			float3 colour;
 
 			float4x4 localToWorld;
+			
+			// Shadow properties
+			float _ShadowIntensity;
+			float4 _ShadowColor;
 
 			struct v2f
 			{
@@ -38,6 +46,7 @@ Shader "Fluid/ParticleBillboard" {
 				float2 uv : TEXCOORD0;
 				float3 colour : TEXCOORD1;
 				float3 normal : NORMAL;
+				float3 viewLightDir : TEXCOORD2; // Light direction in view space
 			};
 
 			v2f vert (appdata_full v, uint instanceID : SV_InstanceID)
@@ -50,6 +59,9 @@ Shader "Fluid/ParticleBillboard" {
 				float3 objectVertPos = v.vertex * scale * 2;
 				float4 viewPos = mul(UNITY_MATRIX_V, float4(centreWorld, 1)) + float4(objectVertPos, 0);
 				o.pos = mul(UNITY_MATRIX_P, viewPos);
+
+				// Use manually set light direction, transform to view space
+				o.viewLightDir = normalize(mul((float3x3)UNITY_MATRIX_V, _MainLightDirection));
 
 				// Choose color based on mode
 				if (_UseParticleColors > 0)
@@ -93,9 +105,41 @@ Shader "Fluid/ParticleBillboard" {
 
 			float4 frag (v2f i) : SV_Target
 			{
-				float shading = saturate(dot(_WorldSpaceLightPos0.xyz, i.normal));
-				shading = (shading + 0.6) / 1.4;
-				return float4(i.colour, 1);
+				// Convert UV from [0,1] to centered coordinates [-1,1]
+				float2 centeredUV = i.uv * 2.0 - 1.0;
+				
+				// Calculate distance from center
+				float distanceFromCenter = length(centeredUV);
+				
+				// Discard pixels outside the circle (radius = 1.0)
+				if (distanceFromCenter > 1.0)
+				{
+					discard;
+				}
+				
+				// Optional: Add soft edge falloff for smoother circles
+				float alpha = 1.0 - smoothstep(0.9, 1.0, distanceFromCenter);
+				
+				// Calculate sphere normal at this pixel (points out of screen in view space)
+				// For a billboard facing the camera, the normal in view space is:
+				// (centeredUV.x, centeredUV.y, sqrt(1 - r²))
+				float z = sqrt(1.0 - distanceFromCenter * distanceFromCenter);
+				float3 sphereNormal = normalize(float3(centeredUV.x, centeredUV.y, z));
+				
+				// Simple N·L lighting with the main light
+				float NdotL = dot(sphereNormal, i.viewLightDir);
+				
+				// Remap from [-1, 1] to a nicer lighting range
+				// This creates the crescent shadow effect!
+				float lightingFactor = NdotL * 0.5 + 0.5; // Map to [0, 1]
+				
+				// Apply shadow intensity and color
+				// When lightingFactor is low (shadows), blend toward shadow color
+				// When lightingFactor is high (highlights), use full color
+				float shadowAmount = (1.0 - lightingFactor) * _ShadowIntensity;
+				float3 litColor = lerp(i.colour, i.colour * _ShadowColor.rgb, shadowAmount);
+				
+				return float4(litColor, alpha);
 			}
 
 			ENDCG

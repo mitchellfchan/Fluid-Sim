@@ -1,0 +1,905 @@
+#pragma kernel ExternalForces
+#pragma kernel UpdateSpatialHash
+#pragma kernel Reorder
+#pragma kernel ReorderCopyBack
+#pragma kernel CalculateDensities
+#pragma kernel CalculatePressureForce
+#pragma kernel CalculateViscosity
+#pragma kernel UpdatePositions
+#pragma kernel UpdateDensityTexture
+
+
+// Includes
+#include "./FluidMaths3D.hlsl"
+#include "./SpatialHash3D.hlsl"
+
+static const int ThreadGroupSize = 256;
+
+
+// Buffers
+RWStructuredBuffer<float3> Positions;
+RWStructuredBuffer<float3> PredictedPositions;
+RWStructuredBuffer<float3> Velocities;
+RWStructuredBuffer<float2> Densities; // Density, Near Density
+RWStructuredBuffer<uint> ParticleIDs; // Persistent particle IDs (for consistent coloring)
+
+// Spatial hashing
+RWStructuredBuffer<uint> SpatialKeys;
+RWStructuredBuffer<uint> SpatialOffsets;
+StructuredBuffer<uint> SortedIndices;
+
+RWStructuredBuffer<float3> Debug;
+
+// Settings
+const uint numParticles;
+const float gravity;
+const float deltaTime;
+const float simTime;
+const float collisionDamping;
+const float smoothingRadius;
+const float targetDensity;
+const float pressureMultiplier;
+const float nearPressureMultiplier;
+const float viscosityStrength;
+const float edgeForce;
+const float edgeForceDst;
+const float3 boundsSize;
+
+// Shape type constants (must match C# CollisionShape enum)
+static const int SHAPE_NONE = 0;
+static const int SHAPE_SPHERE = 1;
+static const int SHAPE_BOX = 2;
+static const int SHAPE_CYLINDER = 3;
+static const int SHAPE_CAPSULE = 4;
+static const int SHAPE_COMPOSITE = 5;
+
+// ===== FORCE ZONE SYSTEM =====
+struct GPUForceZone
+{
+    float3 position;             // 12 bytes
+    float radius;                // 4 bytes
+    
+    float3 forceDirection;       // 12 bytes
+    int shapeType;               // 4 bytes (ForceZoneShape as int)
+    
+    float3 size;                 // 12 bytes
+    int forceMode;               // 4 bytes (ForceZoneMode as int)
+    
+    float forceStrength;         // 4 bytes
+    float isActive;              // 4 bytes (bool as float)
+    float vortexTwist;           // 4 bytes
+    float turbulenceFrequency;   // 4 bytes
+    
+    // Rotation support
+    float4x4 rotationMatrix;    // 64 bytes
+    float3 vortexAxis;           // 12 bytes
+    float turbulenceOctaves;     // 4 bytes
+    
+    // Falloff curve sampling (8 samples)
+    float4 falloffSamples0;      // 16 bytes (samples 0-3)
+    float4 falloffSamples1;      // 16 bytes (samples 4-7)
+    
+    // Rigid collision properties (for RigidStatic and RigidDynamic modes)
+    float3 velocity;             // 12 bytes - linear velocity
+    float mass;                  // 4 bytes - for momentum transfer
+    
+    float bounciness;            // 4 bytes - restitution coefficient
+    float friction;              // 4 bytes - friction coefficient
+    float3 angularVelocity;      // 12 bytes - rotation speed (radians/second)
+    
+    float3 rotationCenter;       // 12 bytes - true pivot point for rotation
+    float padding;               // 4 bytes - keep 16-byte alignment
+    
+    // Total: 232 bytes (16-byte aligned)
+};
+
+// Force zone buffer and settings
+StructuredBuffer<GPUForceZone> ForceZones;
+const uint numForceZones;
+const uint maxForceZones;
+
+// Force mode constants (must match C# ForceZoneMode enum)
+static const int FORCEMODE_NONE = 0;
+static const int FORCEMODE_DIRECTIONAL = 1;
+static const int FORCEMODE_RADIAL = 2;
+static const int FORCEMODE_VORTEX = 3;
+static const int FORCEMODE_TURBULENCE = 4;
+static const int FORCEMODE_DIRECTIONAL_WITH_FALLOFF = 5;
+static const int FORCEMODE_RIGID_STATIC = 6;
+static const int FORCEMODE_RIGID_DYNAMIC = 7;
+
+const float4x4 localToWorld;
+const float4x4 worldToLocal;
+
+const float2 interactionInputPoint;
+const float interactionInputStrength;
+const float interactionInputRadius;
+
+
+
+// Volume texture settings
+RWTexture3D<float> DensityMap;
+const uint3 densityMapSize;
+
+
+
+
+float PressureFromDensity(float density)
+{
+    return (density - targetDensity) * pressureMultiplier;
+}
+
+float NearPressureFromDensity(float nearDensity)
+{
+    return nearDensity * nearPressureMultiplier;
+}
+
+
+float Remap01(float val, float minVal, float maxVal)
+{
+    return saturate((val - minVal) / (maxVal - minVal));
+}
+
+// ===== FORCE ZONE HELPER FUNCTIONS =====
+
+// Sample falloff curve using linear interpolation between the 8 baked samples
+float SampleFalloffCurve(float t, GPUForceZone zone)
+{
+    t = saturate(t); // Clamp to [0, 1]
+    float samplePos = t * 7.0; // Map to [0, 7]
+    int index = floor(samplePos);
+    float frac = samplePos - index;
+    
+    // Get the two samples to interpolate between
+    float sample1, sample2;
+    if (index < 4)
+    {
+        sample1 = zone.falloffSamples0[index];
+        sample2 = (index < 3) ? zone.falloffSamples0[index + 1] : zone.falloffSamples1[0];
+    }
+    else
+    {
+        int idx = index - 4;
+        sample1 = zone.falloffSamples1[idx];
+        sample2 = (idx < 3) ? zone.falloffSamples1[idx + 1] : zone.falloffSamples1[3];
+    }
+    
+    return lerp(sample1, sample2, frac);
+}
+
+// Simple 3D noise function for turbulence
+float Noise3D(float3 p)
+{
+    float3 i = floor(p);
+    float3 f = frac(p);
+    f = f * f * (3.0 - 2.0 * f); // Smoothstep
+    
+    float n = i.x + i.y * 57.0 + i.z * 113.0;
+    return lerp(
+        lerp(lerp(frac(sin(n + 0.0) * 43758.5453),
+                  frac(sin(n + 1.0) * 43758.5453), f.x),
+             lerp(frac(sin(n + 57.0) * 43758.5453),
+                  frac(sin(n + 58.0) * 43758.5453), f.x), f.y),
+        lerp(lerp(frac(sin(n + 113.0) * 43758.5453),
+                  frac(sin(n + 114.0) * 43758.5453), f.x),
+             lerp(frac(sin(n + 170.0) * 43758.5453),
+                  frac(sin(n + 171.0) * 43758.5453), f.x), f.y), f.z);
+}
+
+// Fractal Brownian Motion for turbulence
+float3 Turbulence3D(float3 p, float frequency, float octaves)
+{
+    float3 result = float3(0, 0, 0);
+    float amplitude = 1.0;
+    float totalAmplitude = 0.0;
+    
+    for (int i = 0; i < (int)octaves; i++)
+    {
+        result.x += (Noise3D(p * frequency) - 0.5) * amplitude;
+        result.y += (Noise3D(p * frequency + float3(100.0, 0.0, 0.0)) - 0.5) * amplitude;
+        result.z += (Noise3D(p * frequency + float3(0.0, 100.0, 0.0)) - 0.5) * amplitude;
+        
+        totalAmplitude += amplitude;
+        amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+    
+    return result / totalAmplitude;
+}
+
+// ===== UNIFIED SDF FUNCTIONS =====
+
+float SphereSDF(float3 pos, float3 center, float radius)
+{
+    return length(pos - center) - radius;
+}
+
+float BoxSDF(float3 pos, float3 center, float3 size)
+{
+    float3 d = abs(pos - center) - size * 0.5;
+    return max(d.x, max(d.y, d.z));
+}
+
+float CapsuleSDF(float3 pos, float3 pointA, float3 pointB, float radius)
+{
+    float3 pa = pos - pointA;
+    float3 ba = pointB - pointA;
+    float h = saturate(dot(pa, ba) / dot(ba, ba));
+    return length(pa - ba * h) - radius;
+}
+
+float CylinderSDF(float3 pos, float3 pointA, float3 pointB, float radius)
+{
+    float3 pa = pos - pointA;
+    float3 ba = pointB - pointA;
+    float h = dot(pa, ba) / dot(ba, ba); // No saturate - allows extending beyond caps
+    
+    // Distance to infinite cylinder axis
+    float radialDist = length(pa - ba * h) - radius;
+    
+    // Distance to caps (flat ends)
+    float capDist = abs(h - 0.5) - 0.5; // Distance beyond normalized height range
+    capDist *= length(ba); // Scale back to world units
+    
+    // Combine: inside cylinder if both radial and cap distances are negative
+    return max(radialDist, capDist);
+}
+
+// ===== FORCE ZONE SDF FUNCTIONS =====
+
+// Calculate SDF distance for any force zone (same logic as collision objects)
+float CalculateZoneSDF(float3 pos, GPUForceZone zone)
+{
+    if (zone.shapeType == SHAPE_SPHERE)
+    {
+        return SphereSDF(pos, zone.position, zone.radius);
+    }
+    else if (zone.shapeType == SHAPE_BOX)
+    {
+        float3 worldOffset = pos - zone.position;
+        float3 localPos = mul(transpose((float3x3)zone.rotationMatrix), worldOffset);
+        return BoxSDF(localPos, float3(0, 0, 0), zone.size);
+    }
+    else if (zone.shapeType == SHAPE_CYLINDER)
+    {
+        float height = zone.size.x;
+        float halfHeight = height * 0.5;
+        float3 localUp = mul((float3x3)zone.rotationMatrix, float3(0, 1, 0));
+        float3 pointA = zone.position - localUp * halfHeight;
+        float3 pointB = zone.position + localUp * halfHeight;
+        return CylinderSDF(pos, pointA, pointB, zone.radius);
+    }
+    else if (zone.shapeType == SHAPE_CAPSULE)
+    {
+        float totalHeight = zone.size.x;
+        float cylinderHeight = max(0.0, totalHeight - 2.0 * zone.radius);
+        float halfCylinderHeight = cylinderHeight * 0.5;
+        float3 localUp = mul((float3x3)zone.rotationMatrix, float3(0, 1, 0));
+        float3 pointA = zone.position - localUp * halfCylinderHeight;
+        float3 pointB = zone.position + localUp * halfCylinderHeight;
+        return CapsuleSDF(pos, pointA, pointB, zone.radius);
+    }
+    return 1000.0;
+}
+
+// Calculate surface normal for any force zone
+float3 CalculateZoneNormal(float3 pos, GPUForceZone zone)
+{
+    if (zone.shapeType == SHAPE_SPHERE)
+    {
+        return normalize(pos - zone.position);
+    }
+    else if (zone.shapeType == SHAPE_BOX)
+    {
+        float3 worldOffset = pos - zone.position;
+        float3 localPos = mul(transpose((float3x3)zone.rotationMatrix), worldOffset);
+        float3 halfSize = zone.size * 0.5;
+        float3 d = abs(localPos) - halfSize;
+        
+        float3 localNormal;
+        if (d.x > d.y && d.x > d.z) {
+            localNormal = float3(sign(localPos.x), 0, 0);
+        } else if (d.y > d.z) {
+            localNormal = float3(0, sign(localPos.y), 0);
+        } else {
+            localNormal = float3(0, 0, sign(localPos.z));
+        }
+        
+        return mul((float3x3)zone.rotationMatrix, localNormal);
+    }
+    else if (zone.shapeType == SHAPE_CYLINDER)
+    {
+        float height = zone.size.x;
+        float halfHeight = height * 0.5;
+        float3 localUp = mul((float3x3)zone.rotationMatrix, float3(0, 1, 0));
+        float3 pointA = zone.position - localUp * halfHeight;
+        float3 pointB = zone.position + localUp * halfHeight;
+        
+        float3 pa = pos - pointA;
+        float3 ba = pointB - pointA;
+        float h = dot(pa, ba) / dot(ba, ba);
+        
+        if (h < 0.0) return -localUp;
+        else if (h > 1.0) return localUp;
+        else
+        {
+            float3 closestPoint = pointA + ba * h;
+            return normalize(pos - closestPoint);
+        }
+    }
+    else if (zone.shapeType == SHAPE_CAPSULE)
+    {
+        float totalHeight = zone.size.x;
+        float cylinderHeight = max(0.0, totalHeight - 2.0 * zone.radius);
+        float halfCylinderHeight = cylinderHeight * 0.5;
+        float3 localUp = mul((float3x3)zone.rotationMatrix, float3(0, 1, 0));
+        float3 pointA = zone.position - localUp * halfCylinderHeight;
+        float3 pointB = zone.position + localUp * halfCylinderHeight;
+        
+        float3 pa = pos - pointA;
+        float3 ba = pointB - pointA;
+        float h = saturate(dot(pa, ba) / dot(ba, ba));
+        float3 closestPoint = pointA + ba * h;
+        
+        return normalize(pos - closestPoint);
+    }
+    return float3(0, 1, 0);
+}
+
+// Push particle to zone surface (for rigid collisions)
+float3 PushToZoneSurface(float3 pos, GPUForceZone zone, float3 normal)
+{
+    if (zone.shapeType == SHAPE_SPHERE)
+    {
+        return zone.position + normal * zone.radius;
+    }
+    else if (zone.shapeType == SHAPE_BOX)
+    {
+        float3 worldOffset = pos - zone.position;
+        float3 localPos = mul(transpose((float3x3)zone.rotationMatrix), worldOffset);
+        float3 halfSize = zone.size * 0.5;
+        float3 localClosest = clamp(localPos, -halfSize, halfSize);
+        float3 worldClosest = mul((float3x3)zone.rotationMatrix, localClosest) + zone.position;
+        return worldClosest + normal * 0.01;
+    }
+    else if (zone.shapeType == SHAPE_CYLINDER)
+    {
+        float height = zone.size.x;
+        float halfHeight = height * 0.5;
+        float3 localUp = mul((float3x3)zone.rotationMatrix, float3(0, 1, 0));
+        float3 pointA = zone.position - localUp * halfHeight;
+        float3 pointB = zone.position + localUp * halfHeight;
+        
+        float3 pa = pos - pointA;
+        float3 ba = pointB - pointA;
+        float h = dot(pa, ba) / dot(ba, ba);
+        
+        if (h < 0.0) return pointA - localUp * 0.01;
+        else if (h > 1.0) return pointB + localUp * 0.01;
+        else
+        {
+            float3 closestPoint = pointA + ba * h;
+            return closestPoint + normal * zone.radius;
+        }
+    }
+    else if (zone.shapeType == SHAPE_CAPSULE)
+    {
+        float totalHeight = zone.size.x;
+        float cylinderHeight = max(0.0, totalHeight - 2.0 * zone.radius);
+        float halfCylinderHeight = cylinderHeight * 0.5;
+        float3 localUp = mul((float3x3)zone.rotationMatrix, float3(0, 1, 0));
+        float3 pointA = zone.position - localUp * halfCylinderHeight;
+        float3 pointB = zone.position + localUp * halfCylinderHeight;
+        
+        float3 pa = pos - pointA;
+        float3 ba = pointB - pointA;
+        float h = saturate(dot(pa, ba) / dot(ba, ba));
+        float3 closestPoint = pointA + ba * h;
+        
+        return closestPoint + normal * zone.radius;
+    }
+    return pos;
+}
+
+void CalcFZRigid(inout float3 pos, inout float3 vel, GPUForceZone zone)
+{
+    // Calculate surface normal
+    float3 normal = CalculateZoneNormal(pos, zone);
+    
+    // Push particle to surface
+    pos = PushToZoneSurface(pos, zone, normal);
+    
+    if (zone.forceMode == FORCEMODE_RIGID_DYNAMIC)
+    {
+        // ===== DYNAMIC RIGID: Full momentum transfer with rotation =====
+        float3 relativePos = pos - zone.rotationCenter;
+        float3 rotationalVelocity = cross(zone.angularVelocity, relativePos);
+        float3 totalObjectVelocity = zone.velocity + rotationalVelocity;
+        
+        float3 relativeVel = vel - totalObjectVelocity;
+        float relativeNormalVel = dot(relativeVel, normal);
+        
+        if (relativeNormalVel < 0) // Approaching surface
+        {
+            float momentumTransfer = 2 * relativeNormalVel / (1 + zone.mass);
+            float3 velChange = normal * momentumTransfer;
+            vel = vel - velChange * zone.bounciness;
+        }
+    }
+    else
+    {
+        // ===== STATIC RIGID: Simple bounce with friction =====
+        float velNormalMagnitude = dot(vel, normal);
+        float3 velNormal = normal * velNormalMagnitude;
+        float3 velTangential = vel - velNormal;
+        
+        if (velNormalMagnitude < 0) // Moving toward surface
+        {
+            velNormal *= -1; // Reverse normal component
+        }
+        
+        vel = velNormal * zone.bounciness + velTangential * zone.friction;
+    }
+}
+
+// Calculate normalized distance for non-rigid force zones
+// Returns true if particle is inside zone, with normalizedDist output (0 = center, 1 = edge)
+bool IsIntersecting(float3 pos, GPUForceZone zone, float sdfDist, out float normalizedDist)
+{
+    normalizedDist = 1.0; // Default to edge
+    
+    if (zone.shapeType == SHAPE_SPHERE)
+    {
+        float dist = length(pos - zone.position);
+        if (dist > zone.radius) return false; // Outside sphere
+        normalizedDist = saturate(dist / zone.radius);
+        return true;
+    }
+    else if (zone.shapeType == SHAPE_BOX)
+    {
+        if (sdfDist > 0) return false; // Outside box
+        float3 worldOffset = pos - zone.position;
+        float3 localPos = mul(transpose((float3x3)zone.rotationMatrix), worldOffset);
+        float3 halfSize = zone.size * 0.5;
+        float3 d = halfSize - abs(localPos);
+        float minDist = min(d.x, min(d.y, d.z));
+        float maxDimension = max(halfSize.x, max(halfSize.y, halfSize.z));
+        normalizedDist = 1.0 - saturate(minDist / maxDimension);
+        return true;
+    }
+    else if (zone.shapeType == SHAPE_CYLINDER)
+    {
+        if (sdfDist > 0) return false; // Outside cylinder
+        float height = zone.size.x;
+        float halfHeight = height * 0.5;
+        float3 localUp = mul((float3x3)zone.rotationMatrix, float3(0, 1, 0));
+        float3 pointA = zone.position - localUp * halfHeight;
+        float3 pointB = zone.position + localUp * halfHeight;
+        
+        float3 pa = pos - pointA;
+        float3 ba = pointB - pointA;
+        float h = dot(pa, ba) / dot(ba, ba);
+        
+        float radialDist = length(pa - ba * h);
+        normalizedDist = saturate(radialDist / zone.radius);
+        return true;
+    }
+    else if (zone.shapeType == SHAPE_CAPSULE)
+    {
+        if (sdfDist > 0) return false; // Outside capsule
+        normalizedDist = 0.5; // Simplified for capsule
+        return true;
+    }
+    
+    return false; // Unknown shape type
+}
+
+// Calculate force vector based on force zone mode
+float3 CalculateForceByMode(float3 pos, GPUForceZone zone)
+{
+    if (zone.forceMode == FORCEMODE_DIRECTIONAL || zone.forceMode == FORCEMODE_DIRECTIONAL_WITH_FALLOFF)
+    {
+        return zone.forceDirection * zone.forceStrength;
+    }
+    else if (zone.forceMode == FORCEMODE_RADIAL)
+    {
+        float dist = length(pos - zone.position);
+        float3 dir = (dist > 0.001) ? (pos - zone.position) / dist : float3(0, 1, 0);
+        return dir * zone.forceStrength;
+    }
+    else if (zone.forceMode == FORCEMODE_VORTEX)
+    {
+        float3 toPoint = pos - zone.position;
+        float3 axis = zone.vortexAxis;
+        float3 axisPoint = axis * dot(toPoint, axis);
+        float3 radialDir = toPoint - axisPoint;
+        float radialDist = length(radialDir);
+        
+        if (radialDist > 0.001)
+        {
+            radialDir = normalize(radialDir);
+            float3 tangentialDir = cross(axis, radialDir);
+            return (tangentialDir + radialDir * zone.vortexTwist) * zone.forceStrength;
+        }
+    }
+    else if (zone.forceMode == FORCEMODE_TURBULENCE)
+    {
+        float3 turbulence = Turbulence3D(pos, zone.turbulenceFrequency, zone.turbulenceOctaves);
+        return turbulence * zone.forceStrength;
+    }
+    
+    return float3(0, 0, 0); // Unknown or unsupported mode
+}
+
+// ===== UNIFIED FORCE ZONE CALCULATION =====
+
+// Calculate force/collision from a force zone at a given position
+// Returns force to apply (for non-rigid modes) and modifies pos/vel (for rigid modes)
+float3 CalculateForceZoneForce(inout float3 pos, inout float3 vel, GPUForceZone zone)
+{
+    // Skip inactive zones
+    if (zone.isActive < 0.5) return float3(0, 0, 0);
+    
+    // Calculate distance to zone using SDF
+    float sdfDist = CalculateZoneSDF(pos, zone);
+    
+    // ===== RIGID COLLISION MODES =====
+    if (zone.forceMode == FORCEMODE_RIGID_STATIC || zone.forceMode == FORCEMODE_RIGID_DYNAMIC)
+    {
+        if (sdfDist < 0) // Inside rigid volume - collision!
+        {
+            CalcFZRigid(pos, vel, zone); // Modifies pos and vel via inout
+        }
+        
+        return float3(0, 0, 0); // Rigid modes don't apply continuous forces
+    }
+    
+    // ===== NON-RIGID FORCE MODES =====
+    // Calculate normalized distance for falloff (0 at center, 1 at edge)
+    float normalizedDist;
+    bool insideZone = IsIntersecting(pos, zone, sdfDist, normalizedDist);
+    
+    if (!insideZone) return float3(0, 0, 0);
+    
+    // Sample falloff curve and calculate force
+    float falloff = SampleFalloffCurve(normalizedDist, zone);
+    float3 force = CalculateForceByMode(pos, zone);
+    
+    // Apply falloff
+    return force * falloff;
+}
+
+// ===== MODERN COLLISION RESOLUTION =====
+void ResolveCollisions(inout float3 pos, inout float3 vel, float collisionDamping)
+{
+    // 1. Handle boundary collisions
+    float3 posLocal = mul(worldToLocal, float4(pos, 1)).xyz;
+    float3 velocityLocal = mul(worldToLocal, float4(vel, 0)).xyz;
+
+    const float3 halfSize = 0.5;
+    const float3 edgeDst = halfSize - abs(posLocal);
+
+    // Resolve boundary collisions
+    if (edgeDst.x <= 0)
+    {
+        posLocal.x = halfSize.x * sign(posLocal.x);
+        velocityLocal.x *= -1 * collisionDamping;
+    }
+    if (edgeDst.y <= 0)
+    {
+        posLocal.y = halfSize.y * sign(posLocal.y);
+        velocityLocal.y *= -1 * collisionDamping;
+    }
+    if (edgeDst.z <= 0)
+    {
+        posLocal.z = halfSize.z * sign(posLocal.z);
+        velocityLocal.z *= -1 * collisionDamping;
+    }
+
+    pos = mul(localToWorld, float4(posLocal, 1)).xyz;
+    vel = mul(localToWorld, float4(velocityLocal, 0)).xyz;
+
+    // Note: Force zone rigid collisions are handled in ExternalForces kernel
+    // This keeps them consistent with other force applications and allows
+    // position correction before the integration step
+}
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void ExternalForces(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+    // External forces (gravity)
+    Velocities[id.x] += float3(0, gravity, 0) * deltaTime;
+    
+    // ===== APPLY FORCE ZONES =====
+    float3 pos = Positions[id.x];
+    float3 vel = Velocities[id.x];
+    float3 totalForce = float3(0, 0, 0);
+    
+    for (uint i = 0; i < numForceZones; i++)
+    {
+        // Non-rigid modes return force, rigid modes modify pos/vel directly via inout
+        totalForce += CalculateForceZoneForce(pos, vel, ForceZones[i]);
+    }
+    
+    // Apply accumulated forces as acceleration
+    vel += totalForce * deltaTime;
+    
+    // Write back modified position and velocity (rigid zones may have changed pos)
+    Positions[id.x] = pos;
+    Velocities[id.x] = vel;
+
+    // Predict
+    PredictedPositions[id.x] = pos + vel * 1 / 120.0;
+}
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void UpdateSpatialHash(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+    uint index = id.x;
+    int3 cell = GetCell3D(PredictedPositions[index], smoothingRadius);
+    uint hash = HashCell3D(cell);
+    uint key = KeyFromHash(hash, numParticles);
+
+    SpatialKeys[id.x] = key;
+}
+
+
+RWStructuredBuffer<float3> SortTarget_Positions;
+RWStructuredBuffer<float3> SortTarget_PredictedPositions;
+RWStructuredBuffer<float3> SortTarget_Velocities;
+RWStructuredBuffer<uint> SortTarget_ParticleIDs;
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void Reorder(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+    uint sortedIndex = SortedIndices[id.x];
+    SortTarget_Positions[id.x] = Positions[sortedIndex];
+    SortTarget_PredictedPositions[id.x] = PredictedPositions[sortedIndex];
+    SortTarget_Velocities[id.x] = Velocities[sortedIndex];
+    SortTarget_ParticleIDs[id.x] = ParticleIDs[sortedIndex];
+}
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void ReorderCopyBack(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+    Positions[id.x] = SortTarget_Positions[id.x];
+    PredictedPositions[id.x] = SortTarget_PredictedPositions[id.x];
+    Velocities[id.x] = SortTarget_Velocities[id.x];
+    ParticleIDs[id.x] = SortTarget_ParticleIDs[id.x];
+}
+
+float2 CalculateDensitiesAtPoint(float3 pos)
+{
+    int3 originCell = GetCell3D(pos, smoothingRadius);
+    float sqrRadius = smoothingRadius * smoothingRadius;
+    float density = 0;
+    float nearDensity = 0;
+
+    // Neighbour search
+    for (int i = 0; i < 27; i++)
+    {
+        uint hash = HashCell3D(originCell + offsets3D[i]);
+        uint key = KeyFromHash(hash, numParticles);
+        uint currIndex = SpatialOffsets[key];
+
+        while (currIndex < numParticles)
+        {
+            uint neighbourIndex = currIndex;
+            currIndex++;
+
+            uint neighbourKey = SpatialKeys[neighbourIndex];
+            // Exit if no longer looking at correct bin
+            if (neighbourKey != key)
+                break;
+
+            float3 neighbourPos = PredictedPositions[neighbourIndex];
+            float3 offsetToNeighbour = neighbourPos - pos;
+            float sqrDstToNeighbour = dot(offsetToNeighbour, offsetToNeighbour);
+
+            // Skip if not within radius
+            if (sqrDstToNeighbour > sqrRadius)
+                continue;
+
+            // Calculate density and near density
+            float dst = sqrt(sqrDstToNeighbour);
+            density += DensityKernel(dst, smoothingRadius);
+            nearDensity += NearDensityKernel(dst, smoothingRadius);
+        }
+    }
+
+    return float2(density, nearDensity);
+}
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void CalculateDensities(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+    float3 pos = PredictedPositions[id.x];
+    float2 densities = CalculateDensitiesAtPoint(pos);
+
+    Densities[id.x] = densities;
+}
+
+
+
+
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void CalculatePressureForce(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+    // Calculate pressure
+    float density = Densities[id.x][0];
+    float densityNear = Densities[id.x][1];
+    float pressure = PressureFromDensity(density);
+    float nearPressure = NearPressureFromDensity(densityNear);
+    float3 pressureForce = 0;
+    float3 velocity = Velocities[id.x];
+
+    float3 pos = PredictedPositions[id.x];
+    int3 originCell = GetCell3D(pos, smoothingRadius);
+    float sqrRadius = smoothingRadius * smoothingRadius;
+    int neighbourCount = 0;
+
+
+
+
+    // Neighbour search
+    for (int i = 0; i < 27; i++)
+    {
+        uint hash = HashCell3D(originCell + offsets3D[i]);
+        uint key = KeyFromHash(hash, numParticles);
+        uint currIndex = SpatialOffsets[key];
+
+        while (currIndex < numParticles)
+        {
+            uint neighbourIndex = currIndex;
+            currIndex++;
+
+            // Skip if looking at self
+            if (neighbourIndex == id.x) continue;
+
+            uint neighbourKey = SpatialKeys[neighbourIndex];
+            // Exit if no longer looking at correct bin
+            if (neighbourKey != key) break;
+
+            float3 neighbourPos = PredictedPositions[neighbourIndex];
+            float3 offsetToNeighbour = neighbourPos - pos;
+            float sqrDstToNeighbour = dot(offsetToNeighbour, offsetToNeighbour);
+
+            // Skip if not within radius
+            if (sqrDstToNeighbour > sqrRadius) continue;
+
+            // Calculate pressure force
+            float densityNeighbour = Densities[neighbourIndex][0];
+            float nearDensityNeighbour = Densities[neighbourIndex][1];
+            float neighbourPressure = PressureFromDensity(densityNeighbour);
+            float neighbourPressureNear = NearPressureFromDensity(nearDensityNeighbour);
+
+            float sharedPressure = (pressure + neighbourPressure) / 2;
+            float sharedNearPressure = (nearPressure + neighbourPressureNear) / 2;
+
+            float dstToNeighbour = sqrt(sqrDstToNeighbour);
+            float3 dirToNeighbour = dstToNeighbour > 0 ? offsetToNeighbour / dstToNeighbour : float3(0, 1, 0);
+            neighbourCount++;
+
+            // Update pressure force
+            pressureForce += dirToNeighbour * DensityDerivative(dstToNeighbour, smoothingRadius) * sharedPressure / densityNeighbour;
+            pressureForce += dirToNeighbour * NearDensityDerivative(dstToNeighbour, smoothingRadius) * sharedNearPressure / nearDensityNeighbour;
+
+
+        }
+    }
+
+    float3 acceleration = pressureForce / density;
+    float3 velocityNew = velocity + acceleration * deltaTime;
+    Velocities[id.x] = velocityNew;
+
+    // Quick test -- apply some drag to airborne fluid particles
+    if (neighbourCount < 8)
+    {
+        Velocities[id.x] -= Velocities[id.x] * deltaTime * 0.75;
+    }
+
+
+
+
+}
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void CalculateViscosity(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+    float3 pos = PredictedPositions[id.x];
+    int3 originCell = GetCell3D(pos, smoothingRadius);
+    float sqrRadius = smoothingRadius * smoothingRadius;
+
+    float3 viscosityForce = 0;
+    float3 velocity = Velocities[id.x];
+
+    // Neighbour search
+    for (int i = 0; i < 27; i++)
+    {
+        uint hash = HashCell3D(originCell + offsets3D[i]);
+        uint key = KeyFromHash(hash, numParticles);
+        uint currIndex = SpatialOffsets[key];
+
+        while (currIndex < numParticles)
+        {
+            uint neighbourIndex = currIndex;
+            currIndex++;
+
+            uint neighbourKey = SpatialKeys[neighbourIndex];
+            // Exit if no longer looking at correct bin
+            if (neighbourKey != key)
+                break;
+
+
+            // Skip if looking at self
+            if (neighbourIndex == id.x)
+                continue;
+
+            float3 neighbourPos = PredictedPositions[neighbourIndex];
+            float3 offsetToNeighbour = neighbourPos - pos;
+            float sqrDstToNeighbour = dot(offsetToNeighbour, offsetToNeighbour);
+
+            // Skip if not within radius
+            if (sqrDstToNeighbour > sqrRadius)
+                continue;
+
+            // Calculate viscosity
+            float dst = sqrt(sqrDstToNeighbour);
+            float3 neighbourVelocity = Velocities[neighbourIndex];
+            viscosityForce += (neighbourVelocity - velocity) * SmoothingKernelPoly6(dst, smoothingRadius);
+        }
+    }
+    Velocities[id.x] += viscosityForce * viscosityStrength * deltaTime;
+}
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void UpdatePositions(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+    float3 vel = Velocities[id.x];
+    float3 pos = Positions[id.x];
+    pos += vel * deltaTime;
+
+    ResolveCollisions(pos, vel, collisionDamping);
+
+    // Write results
+    Positions[id.x] = pos;
+    Velocities[id.x] = vel;
+}
+
+[numthreads(8, 8, 8)]
+void UpdateDensityTexture(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= densityMapSize.x || id.y >= densityMapSize.y || id.z >= densityMapSize.z)
+        return;
+
+    // Convert threadID to a world-space position, and sample the fluid density at that point
+    float3 texturePos = id / (densityMapSize - 1.0);
+    float3 worldPos = (texturePos - 0.5) * boundsSize;
+    DensityMap[id] = CalculateDensitiesAtPoint(worldPos)[0];
+}
+
+

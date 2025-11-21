@@ -16,30 +16,49 @@ namespace Seb.Fluid.Simulation
 
 		[Header("Debug Info")] public int debug_num_particles;
 		public float debug_spawn_volume;
+		
+		[Header("Particle Colors")]
+		public bool useRandomColors = true;
+		public Color[] colorPalette = new Color[]
+		{
+			new Color(0.2f, 0.6f, 1.0f, 1.0f), // Blue
+			new Color(0.0f, 0.8f, 0.4f, 1.0f), // Green
+			new Color(1.0f, 0.4f, 0.2f, 1.0f), // Orange
+			new Color(0.8f, 0.2f, 0.8f, 1.0f), // Purple
+			new Color(1.0f, 0.8f, 0.2f, 1.0f), // Yellow
+			new Color(1.0f, 0.2f, 0.2f, 1.0f)  // Red
+		};
 
 
 		public SpawnData GetSpawnData()
 		{
 			List<float3> allPoints = new();
 			List<float3> allVelocities = new();
+			List<float4> allColors = new();
 
 			foreach (SpawnRegion region in spawnRegions)
 			{
 				int particlesPerAxis = region.CalculateParticleCountPerAxis(particleSpawnDensity);
-				(float3[] points, float3[] velocities) = SpawnCube(particlesPerAxis, region.centre, Vector3.one * region.size);
+				// Transform local centre to world space for spawning
+				Vector3 worldCentre = transform.TransformPoint(region.centre);
+				(float3[] points, float3[] velocities, float4[] colors) = SpawnCube(particlesPerAxis, worldCentre, Vector3.one * region.size);
 				allPoints.AddRange(points);
 				allVelocities.AddRange(velocities);
+				allColors.AddRange(colors);
 			}
 
-			return new SpawnData() { points = allPoints.ToArray(), velocities = allVelocities.ToArray() };
+			return new SpawnData() { points = allPoints.ToArray(), velocities = allVelocities.ToArray(), colors = allColors.ToArray() };
 		}
 
-		(float3[] p, float3[] v) SpawnCube(int numPerAxis, Vector3 centre, Vector3 size)
+		(float3[] p, float3[] v, float4[] c) SpawnCube(int numPerAxis, Vector3 centre, Vector3 size)
 		{
 			int numPoints = numPerAxis * numPerAxis * numPerAxis;
 			float3[] points = new float3[numPoints];
 			float3[] velocities = new float3[numPoints];
+			float4[] colors = new float4[numPoints];
 
+			// Use seeded random for consistent colors
+			System.Random seededRandom = new System.Random(42); // Fixed seed for consistent colors
 			int i = 0;
 
 			for (int x = 0; x < numPerAxis; x++)
@@ -56,14 +75,27 @@ namespace Seb.Fluid.Simulation
 						float py = (ty - 0.5f) * size.y + centre.y;
 						float pz = (tz - 0.5f) * size.z + centre.z;
 						float3 jitter = UnityEngine.Random.insideUnitSphere * jitterStrength;
+						
 						points[i] = new float3(px, py, pz) + jitter;
 						velocities[i] = initialVel;
+						
+						// Generate random color for this particle
+						if (useRandomColors && colorPalette.Length > 0)
+						{
+							Color randomColor = colorPalette[seededRandom.Next(0, colorPalette.Length)];
+							colors[i] = new float4(randomColor.r, randomColor.g, randomColor.b, randomColor.a);
+						}
+						else
+						{
+							colors[i] = new float4(1, 1, 1, 1); // Default white color
+						}
+						
 						i++;
 					}
 				}
 			}
 
-			return (points, velocities);
+			return (points, velocities, colors);
 		}
 
 
@@ -91,7 +123,9 @@ namespace Seb.Fluid.Simulation
 				foreach (SpawnRegion region in spawnRegions)
 				{
 					Gizmos.color = region.debugDisplayCol;
-					Gizmos.DrawWireCube(region.centre, Vector3.one * region.size);
+					// Transform local centre to world space for gizmo drawing
+					Vector3 worldCentre = transform.TransformPoint(region.centre);
+					Gizmos.DrawWireCube(worldCentre, Vector3.one * region.size);
 				}
 			}
 		}
@@ -117,6 +151,7 @@ namespace Seb.Fluid.Simulation
 		{
 			public float3[] points;
 			public float3[] velocities;
+			public float4[] colors;
 		}
 	}
 }

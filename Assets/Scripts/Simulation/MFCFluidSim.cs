@@ -7,11 +7,12 @@ using System.Collections.Generic;
 using Seb.Helpers;
 using static Seb.Helpers.ComputeHelper;
 
+
 namespace Seb.Fluid.Simulation
 {
-	public class FluidSim : MonoBehaviour, IFluidSimulation
+	public class MFCFluidSim : MonoBehaviour, IFluidSimulation
 	{
-		public event Action<FluidSim> SimulationInitCompleted;
+		public event Action<MFCFluidSim> SimulationInitCompleted;
 
 		[Header("Time Step")] public float normalTimeScale = 1;
 		public float slowTimeScale = 0.1f;
@@ -26,19 +27,6 @@ namespace Seb.Fluid.Simulation
 		public float viscosityStrength = 0;
 		[Range(0, 1)] public float collisionDamping = 0.95f;
 
-	[Header("Collision Objects System")]
-	[Range(1, 64)] public int maxCollisionObjects = 16;
-	[SerializeField] private List<CollisionObject> collisionObjects = new List<CollisionObject>();
-
-	// Private collision system data
-	private ComputeBuffer collisionObjectBuffer;
-	private GPUCollisionObject[] gpuCollisionObjects;
-	private Vector3[] lastPositions;
-	private Vector3[] velocities;
-	private Vector3[] lastRotations;     // Track rotation changes
-	private Vector3[] angularVelocities; // Calculated angular velocities
-	private bool isFirstFrame = true;
-
 	[Header("Force Zone System")]
 	[Range(1, 32)] public int maxForceZones = 8;
 	[SerializeField] private List<ForceZone> forceZones = new List<ForceZone>();
@@ -46,21 +34,13 @@ namespace Seb.Fluid.Simulation
 	// Private force zone system data
 	private ComputeBuffer forceZoneBuffer;
 	private GPUForceZone[] gpuForceZones;
+	private Vector3[] forceZoneLastPositions;
+	private Vector3[] forceZoneVelocities;
+	private Vector3[] forceZoneLastRotations;
+	private Vector3[] forceZoneAngularVelocities;
+	private bool forceZoneFirstFrame = true;
 
-	[Header("Foam Settings")] public bool foamActive;
-		public int maxFoamParticleCount = 1000;
-		public float trappedAirSpawnRate = 70;
-		public float spawnRateFadeInTime = 0.5f;
-		public float spawnRateFadeStartTime = 0;
-		public Vector2 trappedAirVelocityMinMax = new(5, 25);
-		public Vector2 foamKineticEnergyMinMax = new(15, 80);
-		public float bubbleBuoyancy = 1.5f;
-		public int sprayClassifyMaxNeighbours = 5;
-		public int bubbleClassifyMinNeighbours = 15;
-		public float bubbleScale = 0.5f;
-		public float bubbleChangeScaleSpeed = 7;
-
-		[Header("Volumetric Render Settings")] public bool renderToTex3D;
+			[Header("Volumetric Render Settings")] public bool renderToTex3D;
 		public int densityTextureRes;
 
 		[Header("References")] public ComputeShader compute;
@@ -70,9 +50,7 @@ namespace Seb.Fluid.Simulation
 		public Vector3 Scale => transform.localScale;
 
 		// Buffers
-		public ComputeBuffer foamBuffer { get; private set; }
-		public ComputeBuffer foamSortTargetBuffer { get; private set; }
-		public ComputeBuffer foamCountBuffer { get; private set; }
+	
 		public ComputeBuffer positionBuffer { get; private set; }
 		public ComputeBuffer velocityBuffer { get; private set; }
 		public ComputeBuffer densityBuffer { get; private set; }
@@ -111,14 +89,10 @@ namespace Seb.Fluid.Simulation
 
 		void Start()
 		{
-			Debug.Log("Controls: Space = Play/Pause, Q = SlowMode, R = Reset");
-			isPaused = false;
+		isPaused = false;
 
-			Initialize();
-			InitializeCollisionSystem();
-		}
-
-		void Initialize()
+		Initialize();
+	}		void Initialize()
 		{
 			spawnData = spawner.GetSpawnData();
 			int numParticles = spawnData.points.Length;
@@ -131,9 +105,7 @@ namespace Seb.Fluid.Simulation
 			velocityBuffer = CreateStructuredBuffer<float3>(numParticles);
 			densityBuffer = CreateStructuredBuffer<float2>(numParticles);
 			particleIDBuffer = CreateStructuredBuffer<uint>(numParticles);
-			foamBuffer = CreateStructuredBuffer<FoamParticle>(maxFoamParticleCount);
-			foamSortTargetBuffer = CreateStructuredBuffer<FoamParticle>(maxFoamParticleCount);
-			foamCountBuffer = CreateStructuredBuffer<uint>(4096);
+
 			debugBuffer = CreateStructuredBuffer<float3>(numParticles);
 
 			sortTarget_positionBuffer = CreateStructuredBuffer<float3>(numParticles);
@@ -155,9 +127,6 @@ namespace Seb.Fluid.Simulation
 				{ sortTarget_predictedPositionsBuffer, "SortTarget_PredictedPositions" },
 				{ sortTarget_velocityBuffer, "SortTarget_Velocities" },
 				{ sortTarget_particleIDBuffer, "SortTarget_ParticleIDs" },
-				{ foamCountBuffer, "WhiteParticleCounters" },
-				{ foamBuffer, "WhiteParticles" },
-				{ foamSortTargetBuffer, "WhiteParticlesCompacted" },
 				{ debugBuffer, "Debug" }
 			};
 
@@ -226,8 +195,6 @@ namespace Seb.Fluid.Simulation
 				velocityBuffer,
 				spatialHash.SpatialKeys,
 				spatialHash.SpatialOffsets,
-				foamBuffer,
-				foamCountBuffer,
 				debugBuffer
 			});
 
@@ -257,31 +224,13 @@ namespace Seb.Fluid.Simulation
 				spatialHash.SpatialOffsets,
 			});
 
-			// Foam update kernel
-			SetBuffers(compute, foamUpdateKernel, bufferNameLookup, new ComputeBuffer[]
-			{
-				foamBuffer,
-				foamCountBuffer,
-				predictedPositionsBuffer,
-				densityBuffer,
-				velocityBuffer,
-				spatialHash.SpatialKeys,
-				spatialHash.SpatialOffsets,
-				foamSortTargetBuffer,
-				//debugBuffer
-			});
+			
 
 
-			// Foam reorder copyback kernel
-			SetBuffers(compute, foamReorderCopyBackKernel, bufferNameLookup, new ComputeBuffer[]
-			{
-				foamBuffer,
-				foamSortTargetBuffer,
-				foamCountBuffer,
-			});
+
 
 			compute.SetInt("numParticles", positionBuffer.count);
-			compute.SetInt("MaxWhiteParticleCount", maxFoamParticleCount);
+	
 
 			UpdateSmoothingConstants();
 
@@ -295,18 +244,7 @@ namespace Seb.Fluid.Simulation
 			SimulationInitCompleted?.Invoke(this);
 		}
 
-		private void InitializeCollisionSystem()
-		{
-			// Create collision object buffer
-			gpuCollisionObjects = new GPUCollisionObject[maxCollisionObjects];
-			collisionObjectBuffer = new ComputeBuffer(maxCollisionObjects, System.Runtime.InteropServices.Marshal.SizeOf<GPUCollisionObject>());
-			
-			// Initialize tracking arrays
-			InitializeCollisionObjectTracking();
-		}
-
 		
-
 		void Update()
 		{
 			// Run simulation
@@ -338,12 +276,7 @@ namespace Seb.Fluid.Simulation
 				RunSimulationStep();
 			}
 
-			// Foam and spray particles
-			if (foamActive)
-			{
-				Dispatch(compute, maxFoamParticleCount, kernelIndex: foamUpdateKernel);
-				Dispatch(compute, maxFoamParticleCount, kernelIndex: foamReorderCopyBackKernel);
-			}
+
 
 			// 3D density map
 			if (renderToTex3D)
@@ -421,184 +354,71 @@ namespace Seb.Fluid.Simulation
 			compute.SetVector("boundsSize", simBoundsSize);
 			compute.SetVector("centre", simBoundsCentre);
 
-			compute.SetMatrix("localToWorld", transform.localToWorldMatrix);
-			compute.SetMatrix("worldToLocal", transform.worldToLocalMatrix);
+		compute.SetMatrix("localToWorld", transform.localToWorldMatrix);
+		compute.SetMatrix("worldToLocal", transform.worldToLocalMatrix);
 
-			// Foam settings
-			float fadeInT = (spawnRateFadeInTime <= 0) ? 1 : Mathf.Clamp01((simTimer - spawnRateFadeStartTime) / spawnRateFadeInTime);
-			compute.SetVector("trappedAirParams", new Vector3(trappedAirSpawnRate * fadeInT * fadeInT, trappedAirVelocityMinMax.x, trappedAirVelocityMinMax.y));
-			compute.SetVector("kineticEnergyParams", foamKineticEnergyMinMax);
-			compute.SetFloat("bubbleBuoyancy", bubbleBuoyancy);
-			compute.SetInt("sprayClassifyMaxNeighbours", sprayClassifyMaxNeighbours);
-			compute.SetInt("bubbleClassifyMinNeighbours", bubbleClassifyMinNeighbours);
-			compute.SetFloat("bubbleScaleChangeSpeed", bubbleChangeScaleSpeed);
-			compute.SetFloat("bubbleScale", bubbleScale);
-
-
-
-		UpdateCollisionObjects();
-		UploadCollisionObjectsToGPU();
-		
 		UpdateForceZones();
 		UploadForceZonesToGPU();
-	}		
-	private void UpdateCollisionObjects()
+	}
+	private void UpdateForceZones()
 	{
-		// Safety check - ensure arrays are initialized
-		if (velocities == null || lastPositions == null || lastRotations == null || angularVelocities == null)
+		// Initialize tracking arrays on first call
+		if (forceZoneLastPositions == null || forceZoneLastPositions.Length != maxForceZones)
 		{
-			lastPositions = new Vector3[maxCollisionObjects];
-			velocities = new Vector3[maxCollisionObjects];
-			lastRotations = new Vector3[maxCollisionObjects];
-			angularVelocities = new Vector3[maxCollisionObjects];
+			forceZoneLastPositions = new Vector3[maxForceZones];
+			forceZoneVelocities = new Vector3[maxForceZones];
+			forceZoneLastRotations = new Vector3[maxForceZones];
+			forceZoneAngularVelocities = new Vector3[maxForceZones];
 		}
 		
 		float deltaTime = Time.deltaTime;
 		
-		for (int i = 0; i < collisionObjects.Count; i++)
-		{
-			var obj = collisionObjects[i];
-			
-			// Update position from transform
-			if (obj.transform != null)
-			{
-				Vector3 currentPosition = obj.transform.position;
-				obj.position = currentPosition;
-				
-				// Calculate velocity
-				if (!isFirstFrame && deltaTime > 0)
-				{
-					velocities[i] = (currentPosition - lastPositions[i]) / deltaTime;
-				}
-				else
-				{
-					velocities[i] = Vector3.zero;
-				}
-				
-				obj.velocity = velocities[i];
-				lastPositions[i] = currentPosition;
-				
-				// Calculate angular velocity from rotation changes
-				Vector3 currentRotation = obj.transform.eulerAngles;
-				obj.rotation = currentRotation;
-				
-				if (!isFirstFrame && deltaTime > 0)
-				{
-					// Calculate rotation difference (handling angle wrapping)
-					Vector3 rotationDiff = currentRotation - lastRotations[i];
-					
-					// Handle angle wrapping (e.g., 350° to 10° = 20° change, not -340°)
-					if (rotationDiff.x > 180f) rotationDiff.x -= 360f;
-					if (rotationDiff.x < -180f) rotationDiff.x += 360f;
-					if (rotationDiff.y > 180f) rotationDiff.y -= 360f;
-					if (rotationDiff.y < -180f) rotationDiff.y += 360f;
-					if (rotationDiff.z > 180f) rotationDiff.z -= 360f;
-					if (rotationDiff.z < -180f) rotationDiff.z += 360f;
-					
-					// Convert to radians/second
-					angularVelocities[i] = rotationDiff * Mathf.Deg2Rad / deltaTime;
-				}
-				else
-				{
-					angularVelocities[i] = Vector3.zero;
-				}
-				
-				obj.angularVelocity = angularVelocities[i];
-				lastRotations[i] = currentRotation;
-				
-				// ===== AUTOMATIC SCALE DETECTION =====
-				Vector3 scale = obj.transform.localScale;
-				
-				if (obj.shapeType == CollisionShape.Sphere)
-				{
-					// For spheres, use the largest scale component as radius multiplier
-					float maxScale = Mathf.Max(scale.x, Mathf.Max(scale.y, scale.z));
-					obj.radius = obj.baseRadius * maxScale;
-				}
-				else if (obj.shapeType == CollisionShape.Box)
-				{
-					// For boxes, apply scale directly to each dimension
-					obj.size = Vector3.Scale(obj.baseSize, scale);
-					
-					// Update rotation for boxes
-					obj.rotation = obj.transform.eulerAngles;
-				}
-				else if (obj.shapeType == CollisionShape.Cylinder)
-				{
-					// For cylinders, scale height with Y and radius with max of X/Z
-					float radiusScale = Mathf.Max(scale.x, scale.z);
-					obj.radius = obj.baseRadius * radiusScale;
-					obj.size = new Vector3(obj.baseSize.x * scale.y, 0, 0); // Height in size.x
-					
-					// Update rotation for cylinders
-					obj.rotation = obj.transform.eulerAngles;
-				}
-				else if (obj.shapeType == CollisionShape.Capsule)
-				{
-					// For capsules, scale height with Y and radius with max of X/Z
-					float radiusScale = Mathf.Max(scale.x, scale.z);
-					obj.radius = obj.baseRadius * radiusScale;
-					obj.size = new Vector3(obj.baseSize.x * scale.y, 0, 0); // Height in size.x
-					
-					// Update rotation for capsules (important for pinball paddles!)
-					obj.rotation = obj.transform.eulerAngles;
-				}
-			}
-			
-			// Update the object in the list
-			collisionObjects[i] = obj;
-		}
-		
-		isFirstFrame = false;
-	}
-
-	private void UploadCollisionObjectsToGPU()
-	{
-		// Safety check - ensure collision system is initialized
-		if (gpuCollisionObjects == null)
-		{
-			gpuCollisionObjects = new GPUCollisionObject[maxCollisionObjects];
-		}
-		
-		if (collisionObjectBuffer == null)
-		{
-			collisionObjectBuffer = new ComputeBuffer(maxCollisionObjects, System.Runtime.InteropServices.Marshal.SizeOf<GPUCollisionObject>());
-		}
-		
-		// Clear GPU array
-		System.Array.Clear(gpuCollisionObjects, 0, maxCollisionObjects);
-		
-		// Convert active collision objects to GPU format
-		for (int i = 0; i < collisionObjects.Count; i++)
-		{
-			gpuCollisionObjects[i] = GPUCollisionObject.FromCollisionObject(collisionObjects[i]);
-		}
-		
-		// Upload to GPU
-		collisionObjectBuffer.SetData(gpuCollisionObjects);
-		compute.SetBuffer(externalForcesKernel, "CollisionObjects", collisionObjectBuffer);
-		compute.SetBuffer(updatePositionsKernel, "CollisionObjects", collisionObjectBuffer);
-		compute.SetInt("numCollisionObjects", collisionObjects.Count);
-		compute.SetInt("maxCollisionObjects", maxCollisionObjects);
-	}
-
-	private void UpdateForceZones()
-	{
 		for (int i = 0; i < forceZones.Count; i++)
 		{
 			var zone = forceZones[i];
 			
-			// Debug first zone occasionally
-			if (i == 0 && Time.frameCount % 120 == 0)
-			{
-				Debug.Log($"[UpdateForceZones] BEFORE transform: localDir={zone.localForceDirection}, worldDir={zone.forceDirection}");
-			}
-			
 	// Update position and rotation from transform
 	if (zone.transform != null)
 	{
-		zone.position = zone.transform.position;
+		Vector3 currentPosition = zone.transform.position;
+		zone.position = currentPosition;
 		zone.rotation = zone.transform.rotation;
+		
+		// ===== CALCULATE VELOCITY =====
+		if (!forceZoneFirstFrame && deltaTime > 0)
+		{
+			forceZoneVelocities[i] = (currentPosition - forceZoneLastPositions[i]) / deltaTime;
+		}
+		else
+		{
+			forceZoneVelocities[i] = Vector3.zero;
+		}
+		zone.velocity = forceZoneVelocities[i];
+		forceZoneLastPositions[i] = currentPosition;
+		
+		// ===== CALCULATE ANGULAR VELOCITY =====
+		Vector3 currentRotation = zone.transform.eulerAngles;
+		if (!forceZoneFirstFrame && deltaTime > 0)
+		{
+			Vector3 rotationDiff = currentRotation - forceZoneLastRotations[i];
+			
+			// Handle angle wrapping
+			if (rotationDiff.x > 180f) rotationDiff.x -= 360f;
+			if (rotationDiff.x < -180f) rotationDiff.x += 360f;
+			if (rotationDiff.y > 180f) rotationDiff.y -= 360f;
+			if (rotationDiff.y < -180f) rotationDiff.y += 360f;
+			if (rotationDiff.z > 180f) rotationDiff.z -= 360f;
+			if (rotationDiff.z < -180f) rotationDiff.z += 360f;
+			
+			forceZoneAngularVelocities[i] = rotationDiff * Mathf.Deg2Rad / deltaTime;
+		}
+		else
+		{
+			forceZoneAngularVelocities[i] = Vector3.zero;
+		}
+		zone.angularVelocity = forceZoneAngularVelocities[i];
+		zone.rotationCenter = currentPosition; // Use transform position as rotation center
+		forceZoneLastRotations[i] = currentRotation;
 		
 		// ===== READ FROM SETTINGS COMPONENT IF AVAILABLE =====
 		if (zone.settings != null)
@@ -610,6 +430,11 @@ namespace Seb.Fluid.Simulation
 			zone.turbulenceFrequency = zone.settings.turbulenceFrequency;
 			zone.turbulenceOctaves = zone.settings.turbulenceOctaves;
 			zone.falloffCurve = zone.settings.falloffCurve;
+			
+			// Read rigid collision properties from settings
+			zone.mass = zone.settings.mass;
+			zone.bounciness = zone.settings.bounciness;
+			zone.friction = zone.settings.friction;
 			
 			// Get local-space directions from settings
 			zone.localForceDirection = zone.settings.forceDirection.normalized;
@@ -639,17 +464,13 @@ namespace Seb.Fluid.Simulation
 		// Transform force direction and vortex axis to world space FROM LOCAL SPACE
 		zone.forceDirection = zone.transform.TransformDirection(zone.localForceDirection).normalized;
 		zone.vortexAxis = zone.transform.TransformDirection(zone.localVortexAxis).normalized;
-		
-		// Debug first zone occasionally
-		if (i == 0 && Time.frameCount % 120 == 0)
-		{
-			Debug.Log($"[UpdateForceZones] AFTER transform: localDir={zone.localForceDirection}, worldDir={zone.forceDirection}");
-		}
 	}
 	
 	// Update the zone in the list
 	forceZones[i] = zone;
 		}
+		
+		forceZoneFirstFrame = false;
 	}
 
 	private void UploadForceZonesToGPU()
@@ -677,14 +498,21 @@ namespace Seb.Fluid.Simulation
 	// Upload to GPU
 	forceZoneBuffer.SetData(gpuForceZones);
 	compute.SetBuffer(externalForcesKernel, "ForceZones", forceZoneBuffer);
+	compute.SetBuffer(updatePositionsKernel, "ForceZones", forceZoneBuffer); // Also bind to UpdatePositions for rigid collisions
 	compute.SetInt("numForceZones", forceZones.Count);
 	compute.SetInt("maxForceZones", maxForceZones);
 	
-	// Debug: Log first force zone if any exist
-	if (forceZones.Count > 0 && Time.frameCount % 120 == 0) // Log every 2 seconds at 60fps
+	// Debug: Log rigid force zones
+	if (Time.frameCount % 120 == 0) // Every 2 seconds at 60fps
 	{
-		var zone = forceZones[0];
-		Debug.Log($"[ForceZone Debug] Zone 0: pos={zone.position}, dir={zone.forceDirection}, strength={zone.forceStrength}, mode={zone.forceMode}, active={zone.isActive}");
+		for (int i = 0; i < forceZones.Count; i++)
+		{
+			var zone = forceZones[i];
+			if (zone.forceMode == ForceZoneMode.RigidStatic || zone.forceMode == ForceZoneMode.RigidDynamic)
+			{
+				// Rigid zone detected (debug logging removed)
+			}
+		}
 	}
 }		void SetInitialBufferData(Spawner3D.SpawnData spawnData)
 		{
@@ -700,10 +528,10 @@ namespace Seb.Fluid.Simulation
 			}
 			particleIDBuffer.SetData(particleIDs);
 
-			foamBuffer.SetData(new FoamParticle[foamBuffer.count]);
+
 
 			debugBuffer.SetData(new float3[debugBuffer.count]);
-			foamCountBuffer.SetData(new uint[foamCountBuffer.count]);
+
 			simTimer = 0;
 		}
 
@@ -751,96 +579,10 @@ namespace Seb.Fluid.Simulation
 			}
 
 	spatialHash.Release();
-	collisionObjectBuffer?.Release();
 	forceZoneBuffer?.Release();
 }
 
-	#region Collision Object Management
-		public bool AddCollisionObject(CollisionObject obj)
-		{
-			if (collisionObjects.Count >= maxCollisionObjects)
-			{
-				Debug.LogWarning($"Cannot add collision object: Maximum {maxCollisionObjects} objects reached!");
-				return false;
-			}
-			
-			collisionObjects.Add(obj);
-			InitializeCollisionObjectTracking();
-			return true;
-		}
-
-		public bool RemoveCollisionObject(CollisionObject obj)
-		{
-			bool removed = collisionObjects.Remove(obj);
-			if (removed)
-			{
-				InitializeCollisionObjectTracking();
-			}
-			return removed;
-		}
-
-		public bool RemoveCollisionObjectAt(int index)
-		{
-			if (index >= 0 && index < collisionObjects.Count)
-			{
-				collisionObjects.RemoveAt(index);
-				InitializeCollisionObjectTracking();
-				return true;
-			}
-			return false;
-		}
-
-		public void ClearAllCollisionObjects()
-		{
-			collisionObjects.Clear();
-			InitializeCollisionObjectTracking();
-		}
-
-		public CollisionObject GetCollisionObject(int index)
-		{
-			if (index >= 0 && index < collisionObjects.Count)
-				return collisionObjects[index];
-			return default;
-		}
-
-		public int GetCollisionObjectCount() => collisionObjects.Count;
-		public int GetMaxCollisionObjects() => maxCollisionObjects;
-		
-		public void UpdateCollisionObjectAt(int index, CollisionObject newObj)
-		{
-			if (index >= 0 && index < collisionObjects.Count)
-			{
-				collisionObjects[index] = newObj;
-			}
-		}
-
-		private void InitializeCollisionObjectTracking()
-		{
-			// Resize tracking arrays if needed
-			if (lastPositions == null || lastPositions.Length != maxCollisionObjects)
-			{
-				lastPositions = new Vector3[maxCollisionObjects];
-				velocities = new Vector3[maxCollisionObjects];
-				lastRotations = new Vector3[maxCollisionObjects];
-				angularVelocities = new Vector3[maxCollisionObjects];
-			}
-			
-			// Initialize positions and rotations for new objects
-			for (int i = 0; i < collisionObjects.Count; i++)
-			{
-				if (collisionObjects[i].transform != null)
-				{
-					lastPositions[i] = collisionObjects[i].transform.position;
-					velocities[i] = Vector3.zero;
-					lastRotations[i] = collisionObjects[i].transform.eulerAngles;
-					angularVelocities[i] = Vector3.zero;
-				}
-			}
-		}
-
-		#endregion
-
-		#region Force Zone Management
+	#region Force Zone Management
 		public bool AddForceZone(ForceZone zone)
 		{
 			if (forceZones.Count >= maxForceZones)
@@ -904,8 +646,6 @@ namespace Seb.Fluid.Simulation
 			if (zone.settings == settings)
 			{
 				// The zone will automatically read from settings in next UpdateForceZones call
-				// No need to do anything here, just noting that we found it
-				Debug.Log($"[FluidSim] Force zone {i} will use updated settings from {settings.gameObject.name}");
 			}
 		}
 	}

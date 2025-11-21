@@ -32,15 +32,20 @@ Shader "Fluid/Particle3DSurf"
         #ifdef UNITY_PROCEDURAL_INSTANCING_ENABLED
 			StructuredBuffer<float3> Positions;
 			StructuredBuffer<float3> Velocities;
+			StructuredBuffer<uint> ParticleIDs;
         #endif
 
 
         SamplerState linear_clamp_sampler;
         float velocityMax;
+        int _UseParticleColors;
+        int _ColorGridSize;
+        int _TotalParticles; // Total number of particles for normalization
 
         float scale;
 
         sampler2D ColourMap;
+        sampler2D ParticleColorMap;
 
         void vert(inout appdata_full v, out Input o)
         {
@@ -48,10 +53,42 @@ Shader "Fluid/Particle3DSurf"
             o.uv_MainTex = v.texcoord.xy;
 
             #ifdef UNITY_PROCEDURAL_INSTANCING_ENABLED
-				float speed = length(Velocities[unity_InstanceID]);
-				float speedT = saturate(speed / velocityMax);
-				float colT = speedT;
-				o.colour = tex2Dlod(ColourMap, float4(colT, 0.5,0,0));
+				// Choose color based on mode
+				if (_UseParticleColors > 0)
+				{
+					// ColorMap mode: Map particle ID uniformly across entire texture
+					uint particleID = ParticleIDs[unity_InstanceID];
+					
+					// Normalize particle ID to 0-1 range based on total particles
+					float t = (float)particleID / (float)max(_TotalParticles - 1, 1);
+					
+					// Convert linear t to 2D grid coordinates that cover the whole texture
+					float gridSize = (float)_ColorGridSize;
+					float totalCells = gridSize * gridSize;
+					
+					// Map to grid cell index
+					float cellIndex = t * totalCells;
+					uint gridX = (uint)cellIndex % _ColorGridSize;
+					uint gridY = (uint)cellIndex / _ColorGridSize;
+					
+					// Sample from center of grid cell
+					float gridCellSize = 1.0 / gridSize;
+					float halfCell = gridCellSize * 0.5;
+					
+					float2 uv;
+					uv.x = (float)gridX * gridCellSize + halfCell;
+					uv.y = (float)gridY * gridCellSize + halfCell;
+					
+					o.colour = tex2Dlod(ParticleColorMap, float4(uv, 0, 0));
+				}
+				else
+				{
+					// Velocity-based coloring (original behavior)
+					float speed = length(Velocities[unity_InstanceID]);
+					float speedT = saturate(speed / velocityMax);
+					float colT = speedT;
+					o.colour = tex2Dlod(ColourMap, float4(colT, 0.5, 0, 0));
+				}
             #endif
         }
 
